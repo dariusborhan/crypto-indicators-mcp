@@ -20,30 +20,30 @@ from __future__ import annotations
 import os
 from typing import Any
 
-   from mcp.server.fastmcp import FastMCP
-   from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
-   import datasource as ds
-   import indicators as ind
+import datasource as ds
+import indicators as ind
 
-   # FastMCP auto-enables "DNS rebinding protection" whenever it thinks it is
-   # bound to localhost, and that protection only accepts a Host header of
-   # literally "localhost" or "127.0.0.1". It exists to stop a malicious web page
-   # from using a victim's browser to reach a dev server on their own machine --
-   # a real concern for something running unauthenticated on a laptop, not for a
-   # server deliberately deployed to a public domain. Left on its default here,
-   # every genuine request from a hosted platform (whose Host header is the
-   # platform's own domain, e.g. *.onrender.com) is rejected with HTTP 421
-   # before it reaches any of this file's code.
-   #
-   # stateless_http=True means no per-client session state is held between
-   # requests, so the process can be restarted, scaled, or woken from idle
-   # without breaking an in-flight connection.
-   mcp = FastMCP(
-       "crypto-indicators",
-       stateless_http=True,
-       transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-   )
+# FastMCP auto-enables "DNS rebinding protection" whenever it thinks it is
+# bound to localhost, and that protection only accepts a Host header of
+# literally "localhost" or "127.0.0.1". It exists to stop a malicious web page
+# from using a victim's browser to reach a dev server on their own machine --
+# a real concern for something running unauthenticated on a laptop, not for a
+# server deliberately deployed to a public domain. Left on its default here,
+# every genuine request from a hosted platform (whose Host header is the
+# platform's own domain, e.g. *.onrender.com) is rejected with HTTP 421
+# before it reaches any of this file's code.
+#
+# stateless_http=True means no per-client session state is held between
+# requests, so the process can be restarted, scaled, or woken from idle
+# without breaking an in-flight connection.
+mcp = FastMCP(
+    "crypto-indicators",
+    stateless_http=True,
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 # Assets used to judge the broader market regime.
 REGIME_ASSETS = ("BTC", "ETH")
