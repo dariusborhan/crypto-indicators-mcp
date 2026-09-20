@@ -496,9 +496,42 @@ def _build_http_app():
     return app
 
 
+class _LowercasePathMiddleware:
+    """
+    Normalize the request path to lowercase before routing.
+
+    Observed in practice: at least one MCP client sends its requests to
+    "/MCP" verbatim (confirmed from this server's own access log), even
+    though every path this server defines is lowercase and the client was
+    configured with a lowercase URL. Rather than depend on a client's exact
+    casing -- which is outside this server's control and evidently not
+    reliable -- every path is lowercased at the edge before Starlette's
+    router ever sees it. HTTP paths are case-sensitive by the letter of the
+    spec, but nothing here has two routes that differ only by case, so this
+    is a pure widening of what is accepted, not a behavior change for any
+    request that was already working.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and "path" in scope:
+            scope = dict(scope)
+            scope["path"] = scope["path"].lower()
+            raw_path = scope.get("raw_path")
+            if isinstance(raw_path, bytes):
+                scope["raw_path"] = raw_path.lower()
+        await self.app(scope, receive, send)
+
+
 # Module-level app object, so a platform can also start this with
 #   uvicorn server:app --host 0.0.0.0 --port $PORT
-app = _build_http_app() if os.environ.get("MCP_TRANSPORT", "http") != "stdio" else None
+app = (
+    _LowercasePathMiddleware(_build_http_app())
+    if os.environ.get("MCP_TRANSPORT", "http") != "stdio"
+    else None
+)
 
 
 def main() -> None:
