@@ -1,0 +1,19 @@
+# Render blueprint. Optional -- you can also create the service by hand in the
+# Render dashboard using the same build and start commands shown here.
+services:
+  - type: web
+    name: crypto-indicators-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /health
+    envVars:
+      - key: MCP_TRANSPORT
+        value: http
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # Uncomment to require a bearer token on the /mcp endpoint.
+      # Generate the value in Render with "Generate" rather than typing one.
+      # - key: MCP_AUTH_TOKEN
+      #   generateValue: true
