@@ -431,8 +431,44 @@ def _build_http_app():
             "Connect an MCP client to the /mcp path of this URL.\n"
         )
 
+    async def protected_resource_metadata(request: Request) -> JSONResponse:
+        """
+        OAuth 2.0 Protected Resource Metadata (RFC 9728), at the well-known
+        path MCP clients probe to decide whether a server requires sign-in.
+
+        Without this route the path 404s, which is a bare "nothing here" --
+        some clients treat that ambiguous response as a failed auth check
+        rather than "no authorization in use", surfacing a confusing
+        "asked for sign-in" error even though MCP_AUTH_TOKEN was never set.
+        Answering explicitly with an empty authorization_servers list states
+        outright that this resource requires no OAuth flow. If MCP_AUTH_TOKEN
+        is set, a bearer token is still required on /mcp -- that is a static
+        shared secret, not OAuth, so it is out of scope for this document.
+        """
+        base = f"{request.url.scheme}://{request.url.netloc}"
+        return JSONResponse(
+            {
+                "resource": f"{base}/mcp",
+                "authorization_servers": [],
+            }
+        )
+
     app.router.routes.append(Route("/health", health, methods=["GET"]))
     app.router.routes.append(Route("/", root, methods=["GET"]))
+    app.router.routes.append(
+        Route(
+            "/.well-known/oauth-protected-resource",
+            protected_resource_metadata,
+            methods=["GET"],
+        )
+    )
+    app.router.routes.append(
+        Route(
+            "/.well-known/oauth-protected-resource/mcp",
+            protected_resource_metadata,
+            methods=["GET"],
+        )
+    )
 
     if token:
         from starlette.middleware.base import BaseHTTPMiddleware
