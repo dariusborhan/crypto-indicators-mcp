@@ -187,16 +187,19 @@ def analyze_asset(symbol: str) -> dict[str, Any]:
 
     This is the primary tool for forming a trade thesis. It returns the
     complete indicator set (including Bollinger Bands and Stochastic RSI) on
-    the 1-day, 4-hour, and 1-hour timeframes, plus the asset's relative
-    strength against BTC over the last 30 daily candles and a
+    the 1-week, 1-day, 4-hour, and 1-hour timeframes, plus the asset's
+    relative strength against BTC over the last 30 daily candles and a
     "multi_timeframe_confluence" summary of whether those timeframes actually
-    agree on direction.
+    agree on direction, including a numeric "confluence_score" from -1.0
+    (unanimously bearish) to +1.0 (unanimously bullish).
 
-    Reviewing the daily for trend, the 4-hour for intermediate structure, and
-    the 1-hour for entry/exit timing satisfies the multi-timeframe requirement
-    directly. Read the "data_limitations" field on each timeframe before
-    drawing conclusions -- it lists every indicator that could not be computed
-    and why. Read "multi_timeframe_confluence" before treating a setup as
+    The 1-week timeframe is context, not a timing input: a bullish 1d/4h/1h
+    stack means less when the weekly is rolling over. Reviewing the daily for
+    trend, the 4-hour for intermediate structure, and the 1-hour for
+    entry/exit timing satisfies the multi-timeframe requirement directly.
+    Read the "data_limitations" field on each timeframe before drawing
+    conclusions -- it lists every indicator that could not be computed and
+    why. Read "multi_timeframe_confluence" before treating a setup as
     high-conviction: per the decision hierarchy, prefer trades where multiple
     timeframes agree, and reduce size or stay flat when they conflict.
 
@@ -206,7 +209,7 @@ def analyze_asset(symbol: str) -> dict[str, Any]:
     out: dict[str, Any] = {"symbol": symbol.strip().upper(), "timeframes": {}}
     errors: list[str] = []
 
-    for tf in ("1d", "4h", "1h"):
+    for tf in ("1w", "1d", "4h", "1h"):
         try:
             out["timeframes"][tf] = _analyze_one(symbol, tf)
         except Exception as exc:  # noqa: BLE001
@@ -409,6 +412,172 @@ def suggest_volatility_stop(
         return _error(str(exc), symbol=symbol)
     except Exception as exc:  # noqa: BLE001
         return _error(f"{type(exc).__name__}: {exc}", symbol=symbol)
+
+
+@mcp.tool()
+def suggest_position_size(
+    account_equity_usd: float,
+    entry_price: float,
+    collar_adjusted_stop_price: float,
+    risk_budget_pct: float = 2.5,
+    min_position_usd: float = 50.0,
+    max_position_pct: float = 40.0,
+) -> dict[str, Any]:
+    """
+    Derive a position size from a risk budget instead of a chosen or default
+    dollar amount.
+
+    size_usd = (risk_budget_pct% of account_equity_usd) / (stop distance as a
+    percent of entry price), bounded between min_position_usd and
+    max_position_pct% of equity.
+
+    If the risk-budget-derived size comes out BELOW min_position_usd, that
+    means this stop is too wide for what the account can safely risk on it at
+    the current budget. This is reported as binding_constraint =
+    "min_floor_unmet" with verdict "reject" -- never silently rounded up to
+    the floor, because that would mean accepting more risk than the budget
+    allows just to hit a minimum trade size.
+
+    Args:
+        account_equity_usd: Current total account value.
+        entry_price: Proposed fill price.
+        collar_adjusted_stop_price: The stop price AFTER collar adjustment
+            (stop_trigger_price * 0.95 for a sell stop) -- pass the adjusted
+            figure, not the raw trigger.
+        risk_budget_pct: Percent of equity to risk on this trade. Default 2.5;
+            pass 1.25 when portfolio drawdown is in the 15-25% band per the
+            strategy's risk controls, or use validate_trade_setup instead of
+            calling this directly once drawdown is that high.
+        min_position_usd: Position size floor. Default 50.
+        max_position_pct: Position size ceiling, percent of equity. Default 40.
+    """
+    return ind.suggest_position_size(
+        account_equity_usd=account_equity_usd,
+        entry_price=entry_price,
+        collar_adjusted_stop_price=collar_adjusted_stop_price,
+        risk_budget_pct=risk_budget_pct,
+        min_position_usd=min_position_usd,
+        max_position_pct=max_position_pct,
+    )
+
+
+@mcp.tool()
+def validate_trade_setup(
+    entry_price: float,
+    stop_trigger_price: float,
+    target_price: float,
+    account_equity_usd: float,
+    current_open_risk_usd: float = 0.0,
+    round_trip_cost_pct: float = 0.0,
+    risk_budget_pct: float = 2.5,
+    reward_to_risk_floor: float = 1.5,
+    reward_to_risk_exception_floor: float = 1.2,
+    allow_exception: bool = False,
+    min_position_usd: float = 50.0,
+    max_position_pct: float = 40.0,
+    portfolio_risk_cap_pct: float = 8.0,
+) -> dict[str, Any]:
+    """
+    The hard, external gate a proposed long spot entry must clear before any
+    order is placed. This is the single source of truth for reward-to-risk
+    and position sizing -- do the arithmetic here, not in prose. A past run
+    inverted a reward-to-risk calculation by hand (stating ~0.3-0.6:1 for a
+    setup whose own cited numbers actually worked out to ~1.36-2.73:1); this
+    tool exists so that class of bug cannot happen again.
+
+    Risk is computed off a COLLAR-ADJUSTED stop: collar_adjusted_stop =
+    stop_trigger_price * 0.95, since a live stop_loss order's actual fill
+    collar sits roughly 5% below its trigger for a sell stop. Pass the RAW
+    stop_trigger_price here -- the collar adjustment happens inside this
+    tool, not before calling it.
+
+    round_trip_cost_pct should come from preview_crypto_order's fee estimate
+    (as a percent of notional) and is subtracted from the reward leg before
+    the ratio is computed.
+
+    No order may be placed unless the result's "verdict" is "pass". Quote the
+    full result verbatim in the trade thesis.
+
+    Args:
+        entry_price: Proposed fill price.
+        stop_trigger_price: Proposed protective stop's RAW trigger price
+            (not collar-adjusted -- this tool does that).
+        target_price: Nearest technically defensible target (a real prior
+            swing high/resistance, a breakout-exception projection, etc.).
+        account_equity_usd: Current total account value.
+        current_open_risk_usd: Sum of collar-adjusted dollar risk already
+            committed across all OTHER currently open positions.
+        round_trip_cost_pct: Estimated round-trip trading cost as a percent
+            of notional, from preview_crypto_order.
+        risk_budget_pct: Percent of equity to risk on this trade. Default
+            2.5; use 1.25 in the 15-25% drawdown band per the strategy, 0
+            (which will always fail) above 25% drawdown.
+        reward_to_risk_floor: Hard floor absent the documented exception.
+            Default 1.5.
+        reward_to_risk_exception_floor: Absolute floor even with the
+            exception invoked. Default 1.2.
+        allow_exception: Set True only when the thesis has already named a
+            separate, specific, concrete reason the conventional target
+            understates the opportunity. This tool cannot judge that itself
+            -- it only permits a ratio in [1.2, 1.5) to pass when told to.
+            The calling agent must track that this is used at most once per
+            ten trades and flag it in the journal/summary; this tool has no
+            memory of past calls.
+        min_position_usd: Position size floor. Default 50.
+        max_position_pct: Position size ceiling, percent of equity. Default 40.
+        portfolio_risk_cap_pct: Max total collar-adjusted open risk across the
+            whole portfolio after this trade. Default 8.
+    """
+    return ind.validate_trade_setup(
+        entry_price=entry_price,
+        stop_trigger_price=stop_trigger_price,
+        target_price=target_price,
+        account_equity_usd=account_equity_usd,
+        current_open_risk_usd=current_open_risk_usd,
+        round_trip_cost_pct=round_trip_cost_pct,
+        risk_budget_pct=risk_budget_pct,
+        reward_to_risk_floor=reward_to_risk_floor,
+        reward_to_risk_exception_floor=reward_to_risk_exception_floor,
+        allow_exception=allow_exception,
+        min_position_usd=min_position_usd,
+        max_position_pct=max_position_pct,
+        portfolio_risk_cap_pct=portfolio_risk_cap_pct,
+    )
+
+
+@mcp.tool()
+def get_correlation_matrix(symbols: list[str], lookback_days: int = 30) -> dict[str, Any]:
+    """
+    Pearson correlation of daily returns between every pair of the given
+    assets over the trailing lookback_days, plus each asset's correlation to
+    BTC specifically (include "BTC" in symbols to get this).
+
+    Directly supports the strategy's portfolio diversification rule: hold no
+    more than two positions simultaneously whose 30-day correlation to BTC is
+    above 0.75. Several high-beta altcoins at once can be functionally one
+    leveraged BTC bet even when each individually respects per-position size
+    caps -- this makes that visible as a number instead of a guess.
+
+    Args:
+        symbols: Asset tickers to compare, e.g. ["ATOM", "DOT", "BTC"].
+            Include "BTC" to get the to_btc breakdown.
+        lookback_days: Trailing daily bars to correlate over. Default 30.
+    """
+    try:
+        closes: dict[str, Any] = {}
+        errors: list[str] = []
+        for sym in symbols:
+            try:
+                data = ds.fetch_ohlcv(sym, "1d")
+                closes[data.symbol] = data.df["close"]
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{sym}: {type(exc).__name__}: {exc}")
+        result = ind.correlation_matrix(closes, lookback=lookback_days)
+        if errors:
+            result["fetch_errors"] = errors
+        return result
+    except Exception as exc:  # noqa: BLE001
+        return _error(f"{type(exc).__name__}: {exc}")
 
 
 # ---------------------------------------------------------------------------
