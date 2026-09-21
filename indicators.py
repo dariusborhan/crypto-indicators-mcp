@@ -340,6 +340,179 @@ def atr(
 
 
 # ---------------------------------------------------------------------------
+# Bollinger Bands
+# ---------------------------------------------------------------------------
+
+def bollinger_bands(
+    close: pd.Series, period: int = 20, num_std: float = 2.0
+) -> IndicatorResult:
+    """
+    Bollinger Bands: a simple moving average with upper/lower bands set
+    `num_std` standard deviations away, computed on the same rolling window.
+
+    Reports the three band values, %B (where price sits between the bands --
+    0 at the lower band, 1 at the upper band, and possible to fall outside
+    [0, 1] on a genuine breakout), bandwidth as a percent of the middle band,
+    and a volatility "squeeze" flag: whether the current bandwidth is
+    unusually narrow relative to its own last 40 bars, which often precedes a
+    breakout in either direction (not a directional signal by itself).
+    Squeeze is reported as None -- not guessed -- when there isn't enough
+    history to judge "unusual" against.
+    """
+    n = len(close)
+    if n < period:
+        return _insufficient(n, period, f"Bollinger Bands({period})")
+
+    mid_series = close.rolling(window=period).mean()
+    std_series = close.rolling(window=period).std(ddof=0)
+    if pd.isna(mid_series.iloc[-1]) or pd.isna(std_series.iloc[-1]):
+        return _insufficient(n, period, f"Bollinger Bands({period})")
+
+    upper_series = mid_series + num_std * std_series
+    lower_series = mid_series - num_std * std_series
+
+    mid_val = float(mid_series.iloc[-1])
+    upper_val = float(upper_series.iloc[-1])
+    lower_val = float(lower_series.iloc[-1])
+    last = float(close.iloc[-1])
+
+    band_width = upper_val - lower_val
+    percent_b = (last - lower_val) / band_width if band_width > 0 else None
+    bandwidth_pct = (band_width / mid_val * 100.0) if mid_val else None
+
+    squeeze: bool | None = None
+    baseline_window = 40
+    if bandwidth_pct is not None and n >= period + baseline_window:
+        bw_series = (
+            (upper_series - lower_series) / mid_series * 100.0
+        ).iloc[-baseline_window:].dropna()
+        if len(bw_series) >= 20:
+            squeeze = bool(bandwidth_pct <= bw_series.quantile(0.10))
+
+    if last > upper_val:
+        position = "above upper band (overextended)"
+    elif last < lower_val:
+        position = "below lower band (overextended)"
+    elif percent_b is not None and percent_b >= 0.8:
+        position = "near upper band"
+    elif percent_b is not None and percent_b <= 0.2:
+        position = "near lower band"
+    else:
+        position = "within bands, no extreme"
+
+    return IndicatorResult(
+        value={
+            "upper_band": _round(upper_val),
+            "middle_band": _round(mid_val),
+            "lower_band": _round(lower_val),
+            "percent_b": _round(percent_b),
+            "bandwidth_percent": _round(bandwidth_pct),
+            "position": position,
+            "squeeze": squeeze,
+            "squeeze_note": (
+                "True means current bandwidth is in the narrowest 10% of the "
+                "last 40 bars -- a volatility contraction that often precedes "
+                "a breakout in either direction, not a directional signal by "
+                "itself. None means not enough history to judge."
+            ),
+        },
+        available=True,
+        bars_used=n,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stochastic RSI
+# ---------------------------------------------------------------------------
+
+def stochastic_rsi(
+    close: pd.Series,
+    rsi_period: int = 14,
+    stoch_period: int = 14,
+    k_smooth: int = 3,
+    d_smooth: int = 3,
+) -> IndicatorResult:
+    """
+    Stochastic RSI: the Stochastic oscillator formula applied to RSI values
+    instead of price. Oscillates strictly between 0 and 100 and reacts faster
+    than plain RSI, at the cost of more noise -- useful for timing
+    entries/exits on the shorter timeframe under review, not for establishing
+    trend by itself.
+
+    %K = SMA(k_smooth) of the raw stochastic of RSI over `stoch_period` bars.
+    %D = SMA(d_smooth) of %K.
+    """
+    n = len(close)
+    need = rsi_period + stoch_period + k_smooth + d_smooth
+    if n < need:
+        return _insufficient(n, need, f"Stochastic RSI({rsi_period},{stoch_period})")
+
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / rsi_period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / rsi_period, adjust=False).mean()
+
+    g = avg_gain.to_numpy()
+    l = avg_loss.to_numpy()
+    safe_l = np.where(l == 0.0, 1.0, l)  # placeholder only; unused where l==0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs = g / safe_l
+        raw_rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi_vals = np.where(
+        (g == 0.0) & (l == 0.0), 50.0,
+        np.where(l == 0.0, 100.0, np.where(g == 0.0, 0.0, raw_rsi)),
+    )
+    rsi_series = pd.Series(rsi_vals, index=close.index)
+
+    min_rsi = rsi_series.rolling(window=stoch_period).min()
+    max_rsi = rsi_series.rolling(window=stoch_period).max()
+    denom = max_rsi - min_rsi
+    with np.errstate(divide="ignore", invalid="ignore"):
+        raw_k = (rsi_series - min_rsi) / denom * 100.0
+    # A perfectly flat RSI over the window makes the stochastic undefined;
+    # convention treats it as mid-range rather than leaving it NaN.
+    raw_k = raw_k.where(denom > 0.0, 50.0)
+
+    k = raw_k.rolling(window=k_smooth).mean()
+    d = k.rolling(window=d_smooth).mean()
+
+    if pd.isna(k.iloc[-1]) or pd.isna(d.iloc[-1]):
+        return _insufficient(n, need, f"Stochastic RSI({rsi_period},{stoch_period})")
+
+    k_val = float(k.iloc[-1])
+    d_val = float(d.iloc[-1])
+
+    if k_val >= 80.0:
+        zone = "overbought"
+    elif k_val <= 20.0:
+        zone = "oversold"
+    else:
+        zone = "neutral"
+
+    crossed = None
+    if len(k) >= 2 and not (pd.isna(k.iloc[-2]) or pd.isna(d.iloc[-2])):
+        above_now = k_val > d_val
+        above_prev = bool(k.iloc[-2] > d.iloc[-2])
+        if above_now != above_prev:
+            crossed = "bullish" if above_now else "bearish"
+
+    warm_need = _wilder_warmup(rsi_period) + stoch_period + k_smooth + d_smooth
+    return IndicatorResult(
+        value={
+            "k": _round(k_val),
+            "d": _round(d_val),
+            "zone": zone,
+            "crossover_this_bar": crossed,
+        },
+        available=True,
+        warmup_sufficient=n >= warm_need,
+        bars_used=n,
+        bars_required=warm_need,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Volume
 # ---------------------------------------------------------------------------
 
@@ -611,6 +784,136 @@ def relative_strength(
 
 
 # ---------------------------------------------------------------------------
+# Multi-timeframe confluence
+# ---------------------------------------------------------------------------
+
+def _timeframe_bias(bundle: dict[str, Any]) -> dict[str, Any]:
+    """
+    A simple, auditable directional score for one timeframe's indicator
+    bundle, used only to build cross-timeframe confluence -- it is not a
+    trade signal by itself. Each available signal below contributes +1
+    (bullish) or -1 (bearish); a signal that came back unavailable
+    contributes nothing rather than being guessed.
+    """
+    score = 0
+    signals: list[str] = []
+
+    trend = bundle.get("trend", {})
+    if trend.get("available"):
+        alignment = trend.get("value", {}).get("ma_alignment", "")
+        if alignment.startswith("bullish"):
+            score += 1
+            signals.append("MA alignment bullish")
+        elif alignment.startswith("bearish"):
+            score -= 1
+            signals.append("MA alignment bearish")
+
+    swing = bundle.get("swing_structure", {})
+    if swing.get("available"):
+        structure = swing.get("value", {}).get("market_structure", "")
+        if structure.startswith("uptrend"):
+            score += 1
+            signals.append("swing structure uptrend")
+        elif structure.startswith("downtrend"):
+            score -= 1
+            signals.append("swing structure downtrend")
+
+    macd_entry = bundle.get("macd", {})
+    if macd_entry.get("available"):
+        if macd_entry.get("value", {}).get("macd_above_signal"):
+            score += 1
+            signals.append("MACD above signal")
+        else:
+            score -= 1
+            signals.append("MACD below signal")
+
+    rsi_entry = bundle.get("rsi_14", {})
+    if rsi_entry.get("available"):
+        val = rsi_entry.get("value")
+        if isinstance(val, (int, float)):
+            if val > 50.0:
+                score += 1
+                signals.append("RSI > 50")
+            elif val < 50.0:
+                score -= 1
+                signals.append("RSI < 50")
+
+    stoch_entry = bundle.get("stochastic_rsi", {})
+    if stoch_entry.get("available"):
+        crossed = stoch_entry.get("value", {}).get("crossover_this_bar")
+        if crossed == "bullish":
+            score += 1
+            signals.append("Stochastic RSI bullish crossover")
+        elif crossed == "bearish":
+            score -= 1
+            signals.append("Stochastic RSI bearish crossover")
+
+    bias = "bullish" if score > 0 else "bearish" if score < 0 else "neutral"
+    return {"bias": bias, "score": score, "signals_used": signals}
+
+
+def multi_timeframe_confluence(bundles: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """
+    Cross-timeframe confluence summary from per-timeframe indicator bundles
+    (as produced by compute_all), keyed by timeframe label (e.g. "1d", "4h",
+    "1h").
+
+    For each timeframe, a directional bias is derived only from whichever
+    signals actually came back available (MA alignment, swing structure,
+    MACD, RSI, Stochastic RSI crossover) -- never guessed for a signal
+    reported unavailable. Timeframes are then compared: how many agree on
+    direction, and whether that agreement is unanimous.
+
+    This does not decide whether to trade. It is one more piece of evidence
+    for the decision hierarchy in the strategy rules ("weight decisions by
+    how many independent forms of evidence agree"), to be weighed alongside
+    everything else -- not a standalone signal.
+    """
+    per_tf = {tf: _timeframe_bias(bundle) for tf, bundle in bundles.items()}
+    bullish = [tf for tf, r in per_tf.items() if r["bias"] == "bullish"]
+    bearish = [tf for tf, r in per_tf.items() if r["bias"] == "bearish"]
+    neutral = [tf for tf, r in per_tf.items() if r["bias"] == "neutral"]
+
+    total = len(per_tf)
+    non_neutral = len(bullish) + len(bearish)
+    aligned = non_neutral >= 2 and (len(bullish) == non_neutral or len(bearish) == non_neutral)
+
+    if bullish and not bearish:
+        overall = (
+            f"bullish confluence ({len(bullish)}/{total} timeframes bullish, "
+            f"{len(neutral)} neutral)"
+        )
+    elif bearish and not bullish:
+        overall = (
+            f"bearish confluence ({len(bearish)}/{total} timeframes bearish, "
+            f"{len(neutral)} neutral)"
+        )
+    elif bullish and bearish:
+        overall = (
+            f"conflicting ({len(bullish)} bullish vs {len(bearish)} bearish, "
+            f"{len(neutral)} neutral) -- signals disagree across timeframes"
+        )
+    else:
+        overall = f"no directional lean ({len(neutral)}/{total} timeframes neutral)"
+
+    return {
+        "per_timeframe": per_tf,
+        "timeframes_bullish": len(bullish),
+        "timeframes_bearish": len(bearish),
+        "timeframes_neutral": len(neutral),
+        "aligned": aligned,
+        "overall": overall,
+        "note": (
+            "Each timeframe's bias is a simple count of available directional "
+            "signals (MA alignment, swing structure, MACD, RSI, Stochastic "
+            "RSI crossover); unavailable signals are excluded, never guessed. "
+            "This is supporting evidence for the decision hierarchy, not a "
+            "trade signal by itself."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Full bundle
 # ---------------------------------------------------------------------------
 
@@ -634,7 +937,9 @@ def compute_all(df: pd.DataFrame) -> dict[str, Any]:
         "ema_50": ema(c, 50).to_dict(),
         "ema_200": ema(c, 200).to_dict(),
         "rsi_14": rsi(c, 14).to_dict(),
+        "stochastic_rsi": stochastic_rsi(c).to_dict(),
         "macd": macd(c).to_dict(),
+        "bollinger_bands": bollinger_bands(c).to_dict(),
         "atr_14": atr(h, l, c, 14).to_dict(),
         "volume": volume_profile(v, 20).to_dict(),
         "swing_structure": swing_structure(h, l, c).to_dict(),
