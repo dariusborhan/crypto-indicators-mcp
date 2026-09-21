@@ -153,10 +153,12 @@ def get_indicators(symbol: str, timeframe: str = "1d") -> dict[str, Any]:
     """
     Compute the full technical indicator set for one asset on one timeframe.
 
-    Returns trend and moving averages (SMA/EMA 20/50/200), RSI(14), MACD
-    (12/26/9), ATR(14) including ATR as a percentage of price, volume relative
-    to its 20-period average, confirmed swing highs/lows with market structure,
-    nearest support and resistance, and Fibonacci retracement levels.
+    Returns trend and moving averages (SMA/EMA 20/50/200), RSI(14), Stochastic
+    RSI (14,14,3,3), MACD (12/26/9), Bollinger Bands (20, 2 std) with %B,
+    bandwidth, and a volatility-squeeze flag, ATR(14) including ATR as a
+    percentage of price, volume relative to its 20-period average, confirmed
+    swing highs/lows with market structure, nearest support and resistance,
+    and Fibonacci retracement levels.
 
     Indicators that cannot be computed from the available history are returned
     with available=false and a reason. They are never estimated. Values
@@ -184,13 +186,19 @@ def analyze_asset(symbol: str) -> dict[str, Any]:
     Full multi-timeframe analysis of one asset, in a single call.
 
     This is the primary tool for forming a trade thesis. It returns the
-    complete indicator set on BOTH the 1-day and 4-hour timeframes, plus the
-    asset's relative strength against BTC over the last 30 daily candles.
+    complete indicator set (including Bollinger Bands and Stochastic RSI) on
+    the 1-day, 4-hour, and 1-hour timeframes, plus the asset's relative
+    strength against BTC over the last 30 daily candles and a
+    "multi_timeframe_confluence" summary of whether those timeframes actually
+    agree on direction.
 
-    Reviewing the daily for trend and the 4-hour for timing satisfies the
-    multi-timeframe requirement directly. Read the "data_limitations" field on
-    each timeframe before drawing conclusions -- it lists every indicator that
-    could not be computed and why.
+    Reviewing the daily for trend, the 4-hour for intermediate structure, and
+    the 1-hour for entry/exit timing satisfies the multi-timeframe requirement
+    directly. Read the "data_limitations" field on each timeframe before
+    drawing conclusions -- it lists every indicator that could not be computed
+    and why. Read "multi_timeframe_confluence" before treating a setup as
+    high-conviction: per the decision hierarchy, prefer trades where multiple
+    timeframes agree, and reduce size or stay flat when they conflict.
 
     Args:
         symbol: Asset ticker, e.g. "BTC", "ETH", "SOL".
@@ -198,7 +206,7 @@ def analyze_asset(symbol: str) -> dict[str, Any]:
     out: dict[str, Any] = {"symbol": symbol.strip().upper(), "timeframes": {}}
     errors: list[str] = []
 
-    for tf in ("1d", "4h"):
+    for tf in ("1d", "4h", "1h"):
         try:
             out["timeframes"][tf] = _analyze_one(symbol, tf)
         except Exception as exc:  # noqa: BLE001
@@ -223,6 +231,24 @@ def analyze_asset(symbol: str) -> dict[str, Any]:
             "reason": f"Could not compute: {type(exc).__name__}: {exc}",
         }
 
+    # Cross-timeframe confluence, built from whichever timeframes loaded
+    # successfully. Needs at least two to say anything meaningful.
+    good_bundles = {
+        tf: entry["indicators"]
+        for tf, entry in out["timeframes"].items()
+        if entry.get("indicators") is not None
+    }
+    if len(good_bundles) >= 2:
+        out["multi_timeframe_confluence"] = ind.multi_timeframe_confluence(good_bundles)
+    else:
+        out["multi_timeframe_confluence"] = {
+            "available": False,
+            "reason": (
+                "Fewer than two timeframes loaded successfully; confluence "
+                "requires comparing at least two."
+            ),
+        }
+
     if errors:
         out["errors"] = errors
         out["instruction_to_agent"] = (
@@ -232,7 +258,9 @@ def analyze_asset(symbol: str) -> dict[str, Any]:
     else:
         out["instruction_to_agent"] = (
             "Check 'data_limitations' on each timeframe before citing any "
-            "indicator. Do not cite an indicator reported as unavailable."
+            "indicator. Do not cite an indicator reported as unavailable. "
+            "Check 'multi_timeframe_confluence' before treating a setup as "
+            "high-conviction."
         )
     return out
 
