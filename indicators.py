@@ -896,6 +896,9 @@ def multi_timeframe_confluence(bundles: dict[str, dict[str, Any]]) -> dict[str, 
     else:
         overall = f"no directional lean ({len(neutral)}/{total} timeframes neutral)"
 
+    total_for_score = max(total, 1)
+    confluence_score = round((len(bullish) - len(bearish)) / total_for_score, 3)
+
     return {
         "per_timeframe": per_tf,
         "timeframes_bullish": len(bullish),
@@ -903,12 +906,349 @@ def multi_timeframe_confluence(bundles: dict[str, dict[str, Any]]) -> dict[str, 
         "timeframes_neutral": len(neutral),
         "aligned": aligned,
         "overall": overall,
+        "confluence_score": confluence_score,
+        "confluence_score_note": (
+            "Numeric form of the same verdict, from -1.0 (all timeframes "
+            "bearish) to +1.0 (all bullish), 0.0 for no lean or an even split. "
+            "Useful for mechanically scaling position size (e.g. half the "
+            "normal risk budget when abs(confluence_score) < 0.6) rather than "
+            "branching on the text label."
+        ),
         "note": (
             "Each timeframe's bias is a simple count of available directional "
             "signals (MA alignment, swing structure, MACD, RSI, Stochastic "
             "RSI crossover); unavailable signals are excluded, never guessed. "
             "This is supporting evidence for the decision hierarchy, not a "
             "trade signal by itself."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cross-asset correlation
+# ---------------------------------------------------------------------------
+
+def correlation_matrix(
+    closes: dict[str, pd.Series], lookback: int = 30
+) -> dict[str, Any]:
+    """
+    Pearson correlation of daily returns between every pair of assets in
+    `closes` (symbol -> close-price Series, oldest first), over the trailing
+    `lookback` daily bars, plus each asset's correlation to whichever series
+    is keyed "BTC" if present.
+
+    Used to approximate a portfolio's real diversification: several
+    high-beta altcoins held at once can be functionally one leveraged BTC
+    bet even when each individually respects a per-position size cap, if
+    they are all highly correlated to BTC (and to each other).
+
+    An asset with fewer than `lookback + 1` closes is excluded from the
+    matrix entirely rather than computed from a shorter, silently
+    mismatched window.
+    """
+    returns: dict[str, pd.Series] = {}
+    excluded: list[str] = []
+    for sym, series in closes.items():
+        s = series.dropna()
+        if len(s) < lookback + 1:
+            excluded.append(sym)
+            continue
+        r = s.pct_change().dropna().iloc[-lookback:]
+        if len(r) < lookback:
+            excluded.append(sym)
+            continue
+        returns[sym] = r.reset_index(drop=True)
+
+    symbols = sorted(returns.keys())
+    if len(symbols) < 2:
+        return {
+            "available": False,
+            "reason": (
+                f"Fewer than two symbols had {lookback}+ days of aligned "
+                f"return history; excluded: {excluded}"
+            ),
+            "excluded_insufficient_history": excluded,
+        }
+
+    df = pd.DataFrame({s: returns[s] for s in symbols})
+    corr = df.corr(method="pearson")
+
+    pairs: dict[str, float] = {}
+    for i, a in enumerate(symbols):
+        for b in symbols[i + 1 :]:
+            val = corr.loc[a, b]
+            pairs[f"{a}:{b}"] = _round(float(val)) if pd.notna(val) else None
+
+    to_btc: dict[str, float] = {}
+    if "BTC" in symbols:
+        for s in symbols:
+            if s == "BTC":
+                continue
+            val = corr.loc[s, "BTC"]
+            to_btc[s] = _round(float(val)) if pd.notna(val) else None
+
+    return {
+        "available": True,
+        "lookback_days": lookback,
+        "pairs": pairs,
+        "to_btc": to_btc,
+        "excluded_insufficient_history": excluded,
+        "note": (
+            "Pearson correlation of daily percent returns. Above ~0.75 to BTC "
+            "is treated as high-correlation by the strategy's portfolio "
+            "diversification rule -- holding more than two such positions at "
+            "once is functionally one leveraged BTC bet even if each "
+            "individually respects per-position size limits."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Trade validation -- moves reward-to-risk and sizing arithmetic out of prose
+# ---------------------------------------------------------------------------
+
+def suggest_position_size(
+    account_equity_usd: float,
+    entry_price: float,
+    collar_adjusted_stop_price: float,
+    risk_budget_pct: float = 2.5,
+    min_position_usd: float = 50.0,
+    max_position_pct: float = 40.0,
+) -> dict[str, Any]:
+    """
+    Derive position size from a risk budget, rather than a chosen or default
+    dollar amount.
+
+    size = (risk_budget_pct% of account equity) / (collar-adjusted stop
+    distance, as a percent of entry price)
+
+    bounded below by `min_position_usd` and above by `max_position_pct`% of
+    equity -- but critically, if the risk-budget-derived size comes out BELOW
+    the floor, that means the stop is too wide for this account to risk at
+    the standing budget. This function reports that as a rejection
+    (binding_constraint = "min_floor_unmet"), not as a silently-rounded-up
+    minimum position, because rounding up would mean accepting more risk than
+    the budget allows just to meet the floor.
+    """
+    if entry_price <= 0 or account_equity_usd <= 0:
+        return {
+            "available": False,
+            "reason": "entry_price and account_equity_usd must both be positive.",
+        }
+    if collar_adjusted_stop_price >= entry_price:
+        return {
+            "available": False,
+            "reason": (
+                "collar_adjusted_stop_price must be below entry_price for a "
+                "long position -- a stop at or above entry is not a valid "
+                "invalidation level."
+            ),
+        }
+
+    stop_distance_pct = (entry_price - collar_adjusted_stop_price) / entry_price
+    risk_usd_budget = (risk_budget_pct / 100.0) * account_equity_usd
+    raw_size_usd = risk_usd_budget / stop_distance_pct
+    max_usd = (max_position_pct / 100.0) * account_equity_usd
+
+    if raw_size_usd < min_position_usd:
+        return {
+            "available": True,
+            "size_usd": None,
+            "size_units": None,
+            "risk_usd": None,
+            "binding_constraint": "min_floor_unmet",
+            "raw_risk_budget_size_usd": _round(raw_size_usd),
+            "stop_distance_percent": _round(stop_distance_pct * 100.0),
+            "verdict": "reject",
+            "reason": (
+                f"At a {risk_budget_pct}% risk budget, this stop distance "
+                f"({_round(stop_distance_pct * 100.0)}%) implies a position of "
+                f"only ${_round(raw_size_usd)}, below the ${min_position_usd:g} "
+                f"floor. This means the stop is too wide for what this account "
+                f"can safely risk on it -- do not round up to the floor; the "
+                f"setup does not qualify at this account size."
+            ),
+        }
+
+    if raw_size_usd > max_usd:
+        size_usd = max_usd
+        binding = "max_position_pct_cap"
+    else:
+        size_usd = raw_size_usd
+        binding = "risk_budget"
+
+    return {
+        "available": True,
+        "size_usd": _round(size_usd),
+        "size_units": _round(size_usd / entry_price),
+        "risk_usd": _round(size_usd * stop_distance_pct),
+        "binding_constraint": binding,
+        "stop_distance_percent": _round(stop_distance_pct * 100.0),
+        "verdict": "pass",
+    }
+
+
+def validate_trade_setup(
+    entry_price: float,
+    stop_trigger_price: float,
+    target_price: float,
+    account_equity_usd: float,
+    current_open_risk_usd: float = 0.0,
+    round_trip_cost_pct: float = 0.0,
+    risk_budget_pct: float = 2.5,
+    reward_to_risk_floor: float = 1.5,
+    reward_to_risk_exception_floor: float = 1.2,
+    allow_exception: bool = False,
+    min_position_usd: float = 50.0,
+    max_position_pct: float = 40.0,
+    portfolio_risk_cap_pct: float = 8.0,
+) -> dict[str, Any]:
+    """
+    A single, hard, external gate that a proposed long spot entry must clear
+    before an order is placed -- this replaces doing the reward-to-risk and
+    sizing arithmetic in prose, which is exactly how a past run inverted a
+    reward-to-risk calculation (stating ~0.3-0.6:1 for a setup whose own cited
+    numbers actually worked out to ~1.36-2.73:1). The math happens here once,
+    the same way every time.
+
+    Risk is computed off a COLLAR-ADJUSTED stop, not the raw stop_trigger_price:
+    a live stop_loss order's actual fill collar sits roughly 5% below its
+    trigger for a sell stop, so collar_adjusted_stop = stop_trigger_price *
+    0.95. A ratio computed off the raw trigger flatters itself by roughly 25%.
+
+    round_trip_cost_pct (from preview_crypto_order's fee estimate, as a
+    percent of notional, e.g. 0.5 for 0.5%) is subtracted from the reward leg
+    before the ratio is computed, so trading costs are not merely a
+    qualitative afterthought.
+
+    Set allow_exception=True only when the calling thesis has already named a
+    separate, specific, concrete reason the conventional target understates
+    the opportunity -- this function does not and cannot judge that itself;
+    it only lets a ratio between reward_to_risk_exception_floor and
+    reward_to_risk_floor pass when explicitly told to. The calling agent is
+    responsible for tracking that this exception is used at most once per ten
+    trades and for flagging it in the journal and summary -- this function
+    has no memory across calls.
+
+    Args:
+        entry_price: Proposed fill price.
+        stop_trigger_price: Proposed protective stop's trigger price (not
+            the collar-adjusted figure -- that is computed here).
+        target_price: Nearest technically defensible target.
+        account_equity_usd: Current total account value.
+        current_open_risk_usd: Sum of collar-adjusted dollar risk already
+            committed across all other open positions, before this trade.
+        round_trip_cost_pct: Estimated round-trip trading cost as a percent
+            of notional, from preview_crypto_order.
+        risk_budget_pct: Percent of equity to risk on this trade (2.5 under
+            normal conditions; lower this directly when the drawdown-based
+            risk controls call for it).
+        reward_to_risk_floor: Hard floor, normally 1.5.
+        reward_to_risk_exception_floor: Absolute floor even with the
+            documented exception, normally 1.2.
+        allow_exception: Whether the documented, bounded exception applies
+            to this specific trade (see above).
+        min_position_usd: Position size floor, normally 50.
+        max_position_pct: Position size ceiling as percent of equity,
+            normally 40.
+        portfolio_risk_cap_pct: Maximum total collar-adjusted open risk
+            across the whole portfolio after this trade, normally 8.
+    """
+    reasons: list[str] = []
+
+    if entry_price <= 0 or account_equity_usd <= 0:
+        return {
+            "verdict": "fail",
+            "reasons": ["invalid_inputs"],
+            "detail": "entry_price and account_equity_usd must both be positive.",
+        }
+
+    collar_adjusted_stop = stop_trigger_price * 0.95
+    if collar_adjusted_stop >= entry_price:
+        return {
+            "verdict": "fail",
+            "reasons": ["invalid_stop"],
+            "collar_adjusted_stop": _round(collar_adjusted_stop),
+            "detail": (
+                "Collar-adjusted stop is at or above entry price -- not a "
+                "valid invalidation level for a long position."
+            ),
+        }
+
+    risk_per_unit = entry_price - collar_adjusted_stop
+    risk_pct = risk_per_unit / entry_price
+    risk_usd_amount = risk_per_unit  # per unit; scaled by size below
+
+    reward_per_unit_gross = target_price - entry_price
+    reward_pct_gross = reward_per_unit_gross / entry_price
+    reward_pct_net = reward_pct_gross - (round_trip_cost_pct / 100.0)
+
+    if reward_pct_net <= 0:
+        reward_to_risk = 0.0
+        reasons.append("rr_below_floor")
+    else:
+        reward_to_risk = reward_pct_net / risk_pct
+
+        if reward_to_risk < reward_to_risk_exception_floor:
+            reasons.append("rr_below_floor")
+        elif reward_to_risk < reward_to_risk_floor:
+            if not allow_exception:
+                reasons.append("rr_below_floor")
+            # else: in the narrow 1.2-1.5 band with the exception explicitly
+            # invoked by the caller -- no reason appended, but flagged below.
+
+    sizing = suggest_position_size(
+        account_equity_usd=account_equity_usd,
+        entry_price=entry_price,
+        collar_adjusted_stop_price=collar_adjusted_stop,
+        risk_budget_pct=risk_budget_pct,
+        min_position_usd=min_position_usd,
+        max_position_pct=max_position_pct,
+    )
+
+    position_size_usd = None
+    risk_usd = None
+    portfolio_risk_pct_after = None
+
+    if not sizing.get("available"):
+        reasons.append("sizing_error")
+    elif sizing.get("verdict") == "reject":
+        reasons.append("size_below_50_floor")
+        reasons.append("stop_distance_exceeds_max")
+    else:
+        position_size_usd = sizing["size_usd"]
+        risk_usd = sizing["risk_usd"]
+        portfolio_risk_pct_after = (
+            (current_open_risk_usd + risk_usd) / account_equity_usd * 100.0
+        )
+        if portfolio_risk_pct_after > portfolio_risk_cap_pct:
+            reasons.append("portfolio_risk_cap_exceeded")
+
+    verdict = "pass" if not reasons else "fail"
+
+    return {
+        "collar_adjusted_stop": _round(collar_adjusted_stop),
+        "risk_pct": _round(risk_pct * 100.0),
+        "risk_usd_per_unit": _round(risk_usd_amount),
+        "reward_pct_net_of_costs": _round(reward_pct_net * 100.0),
+        "reward_usd_per_unit": _round(reward_per_unit_gross),
+        "reward_to_risk": _round(reward_to_risk),
+        "reward_to_risk_exception_used": (
+            allow_exception
+            and reward_to_risk_exception_floor <= reward_to_risk < reward_to_risk_floor
+        ),
+        "position_size_usd": position_size_usd,
+        "position_size_detail": sizing,
+        "portfolio_risk_pct_after": (
+            _round(portfolio_risk_pct_after) if portfolio_risk_pct_after is not None else None
+        ),
+        "verdict": verdict,
+        "reasons": reasons,
+        "instruction_to_agent": (
+            "No order may be placed unless verdict is 'pass'. Quote this "
+            "entire result verbatim in the trade thesis -- it is the "
+            "reward-to-risk and sizing arithmetic, computed once, not "
+            "something to redo or round in prose."
         ),
     }
 
