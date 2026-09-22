@@ -580,6 +580,114 @@ def get_correlation_matrix(symbols: list[str], lookback_days: int = 30) -> dict[
         return _error(f"{type(exc).__name__}: {exc}")
 
 
+@mcp.tool()
+def get_liquidity_profile(symbol: str, depth: int = 100) -> dict[str, Any]:
+    """
+    Live Kraken order-book spread and depth snapshot for one asset.
+
+    Returns best bid/ask, spread (absolute, percent, and bps), resting USD
+    depth within 0.5%/1%/2% of the mid price on each side, and a simple
+    bid/ask imbalance ratio. This is a single point-in-time snapshot, not a
+    time series, and covers only Kraken's spot order book -- it has no
+    visibility into futures books, funding, open interest, or off-exchange
+    liquidity.
+
+    Use this to catch assets whose indicators compute fine but whose venue
+    barely trades them: a technically clean setup on a thin book can still
+    fill far worse than the last quoted price, or not fill at all on a limit
+    order. Exclude on liquidity grounds when the intended position size is a
+    large fraction of the 1% depth band, not on spread alone.
+
+    Args:
+        symbol: Asset ticker, e.g. "BTC", "ETH", "SOL".
+        depth: Number of order-book levels to request per side. Default 100.
+    """
+    try:
+        book = ds.fetch_order_book(symbol, depth=depth)
+        result = ind.liquidity_profile(book.bids, book.asks)
+        result["symbol"] = book.symbol
+        result["kraken_pair"] = book.kraken_pair
+        result["source"] = "Kraken public API"
+        result["fetched_at_utc"] = book.fetched_at
+        return result
+    except ds.DataSourceError as exc:
+        return _error(str(exc), symbol=symbol)
+    except Exception as exc:  # noqa: BLE001
+        return _error(f"{type(exc).__name__}: {exc}", symbol=symbol)
+
+
+@mcp.tool()
+def get_regime(symbol: str, timeframe: str = "1d") -> dict[str, Any]:
+    """
+    Classify the asset's current price regime -- trending up, trending down,
+    choppy/ranging, mixed, or a high_vol/low_vol-prefixed variant of any of
+    those -- and how many bars that exact label has persisted.
+
+    get_market_context and get_indicators are stateless: neither one can
+    distinguish "BTC has been grinding down for 11 days" from "BTC just
+    started breaking down today". This tool exists to make that duration
+    visible. Trend/chop comes from Kaufman's Efficiency Ratio over a 20-bar
+    window; volatility comes from ATR(14) as a percent of price, ranked
+    against its own trailing history. Neither is a trade signal by itself --
+    it is context for how much weight a fresh technical signal deserves.
+
+    Args:
+        symbol: Asset ticker, e.g. "BTC", "ETH", "SOL".
+        timeframe: One of 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w. Default "1d".
+    """
+    try:
+        data = ds.fetch_ohlcv(symbol, timeframe)
+        result = ind.market_regime(data.df["close"], data.df["high"], data.df["low"]).to_dict()
+        result["symbol"] = data.symbol
+        result["timeframe"] = timeframe
+        result["source"] = "Kraken public API"
+        result["completed_candles"] = len(data.df)
+        return result
+    except ds.DataSourceError as exc:
+        return _error(str(exc), symbol=symbol)
+    except Exception as exc:  # noqa: BLE001
+        return _error(f"{type(exc).__name__}: {exc}", symbol=symbol)
+
+
+@mcp.tool()
+def detect_divergence(symbol: str, timeframe: str = "1d") -> dict[str, Any]:
+    """
+    Check for regular bullish/bearish divergence between price and RSI(14) /
+    the MACD(12,26,9) histogram, at the two most recent CONFIRMED swing
+    points.
+
+    Bearish: price makes a higher high while the indicator makes a lower
+    high. Bullish: price makes a lower low while the indicator makes a
+    higher low. Checked independently against RSI and MACD, since they can
+    disagree. This is computable from data this server already pulls and is
+    one of the more reliable reversal signals available, but until now
+    required eyeballing raw indicator values across multiple candles.
+
+    Swing points within the most recent few bars are excluded as
+    unconfirmed, so a divergence forming right now will not appear until it
+    confirms. This is supporting evidence for the decision hierarchy, not a
+    standalone trade trigger.
+
+    Args:
+        symbol: Asset ticker, e.g. "BTC", "ETH", "SOL".
+        timeframe: One of 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w. Default "1d".
+    """
+    try:
+        data = ds.fetch_ohlcv(symbol, timeframe)
+        result = ind.detect_divergence(
+            data.df["high"], data.df["low"], data.df["close"]
+        ).to_dict()
+        result["symbol"] = data.symbol
+        result["timeframe"] = timeframe
+        result["source"] = "Kraken public API"
+        result["completed_candles"] = len(data.df)
+        return result
+    except ds.DataSourceError as exc:
+        return _error(str(exc), symbol=symbol)
+    except Exception as exc:  # noqa: BLE001
+        return _error(f"{type(exc).__name__}: {exc}", symbol=symbol)
+
+
 # ---------------------------------------------------------------------------
 # Transport
 # ---------------------------------------------------------------------------

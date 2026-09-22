@@ -74,6 +74,15 @@ class OHLCVResult:
     fetched_at: str
 
 
+@dataclass
+class OrderBookResult:
+    symbol: str
+    kraken_pair: str
+    bids: list[tuple[float, float]]  # (price, volume), best first
+    asks: list[tuple[float, float]]  # (price, volume), best first
+    fetched_at: str
+
+
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -324,6 +333,59 @@ def fetch_ohlcv(
 def _display_symbol(symbol: str) -> str:
     s = symbol.strip().upper()
     return "BTC" if s in ("XBT", "BTC") else s
+
+
+# ---------------------------------------------------------------------------
+# Order book
+# ---------------------------------------------------------------------------
+
+def fetch_order_book(symbol: str, depth: int = 100) -> OrderBookResult:
+    """
+    Fetch a live order-book snapshot for `symbol` from Kraken's public Depth
+    endpoint.
+
+    This is a single point-in-time snapshot, not a time series -- it reflects
+    resting orders at the moment of the request and can change materially a
+    second later. It has no visibility into futures order books, off-exchange
+    liquidity, or hidden/iceberg orders.
+    """
+    pair = resolve_pair(symbol)
+    result = _get("Depth", {"pair": pair, "count": depth})
+
+    book = None
+    for value in result.values():
+        if isinstance(value, dict) and "bids" in value and "asks" in value:
+            book = value
+            break
+    if book is None:
+        raise DataSourceError(
+            f"Kraken Depth response for {pair} contained no order book. "
+            f"Keys present: {list(result.keys())}"
+        )
+
+    def _levels(raw: list) -> list[tuple[float, float]]:
+        out: list[tuple[float, float]] = []
+        for row in raw:
+            try:
+                price, volume = float(row[0]), float(row[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if price > 0 and volume > 0:
+                out.append((price, volume))
+        return out
+
+    bids = _levels(book.get("bids", []))
+    asks = _levels(book.get("asks", []))
+    if not bids or not asks:
+        raise DataSourceError(f"Kraken returned an empty order book for {pair}.")
+
+    return OrderBookResult(
+        symbol=_display_symbol(symbol),
+        kraken_pair=pair,
+        bids=bids,
+        asks=asks,
+        fetched_at=pd.Timestamp.utcnow().isoformat(),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -103,15 +103,25 @@ When running over HTTP the MCP endpoint is at **`/mcp`**, and there is a
 | `get_market_context()` | BTC and ETH daily regime. Run before any altcoin entry. |
 | `compare_to_benchmark(symbol, benchmark, periods)` | Relative performance over N daily candles. |
 | `suggest_volatility_stop(symbol, entry_price, atr_multiple, timeframe)` | ATR-derived stop distance instead of a flat percentage. |
+| `suggest_position_size(account_equity_usd, entry_price, collar_adjusted_stop_price, ...)` | Position size from a risk budget, not a chosen dollar amount. |
+| `validate_trade_setup(entry_price, stop_trigger_price, target_price, ...)` | Hard gate a proposed entry must clear: reward-to-risk and sizing arithmetic computed once, not in prose. |
+| `get_correlation_matrix(symbols, lookback_days)` | Pairwise and to-BTC return correlation, for the portfolio diversification rule. |
+| `get_liquidity_profile(symbol, depth)` | Live order-book spread and depth snapshot (0.5%/1%/2% bands), to catch assets whose indicators compute but whose venue barely trades them. |
+| `get_regime(symbol, timeframe)` | Trend/chop/high-vol label plus how many bars it has persisted — `get_market_context` has no memory of this by itself. |
+| `detect_divergence(symbol, timeframe)` | Regular bullish/bearish divergence between price and RSI/MACD at the last two confirmed swing points. |
 | `list_tradeable_symbols(search)` | Symbols with market data available. |
 
 ### Indicators computed
 
-Trend and SMA/EMA 20/50/200 with MA alignment · RSI(14) · MACD(12/26/9) with
-crossover detection · ATR(14) including ATR as a percentage of price · volume
-vs its 20-period average · confirmed swing highs/lows and market structure ·
-nearest support and resistance · Fibonacci retracement levels · relative
-strength vs a benchmark.
+Trend and SMA/EMA 20/50/200 with MA alignment · RSI(14) · Stochastic RSI
+(14,14,3,3) · MACD(12/26/9) with crossover detection · Bollinger Bands (20, 2
+std) with %B, bandwidth, and squeeze detection · ATR(14) including ATR as a
+percentage of price · volume vs its 20-period average · confirmed swing
+highs/lows and market structure · nearest support and resistance · Fibonacci
+retracement levels · relative strength vs a benchmark · multi-timeframe
+confluence (1w/1d/4h/1h) with a numeric confluence score · cross-asset return
+correlation · order-book spread and depth · trend/chop/high-vol regime with
+duration · RSI/MACD divergence.
 
 ---
 

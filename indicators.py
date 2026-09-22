@@ -925,6 +925,393 @@ def multi_timeframe_confluence(bundles: dict[str, dict[str, Any]]) -> dict[str, 
 
 
 # ---------------------------------------------------------------------------
+# Liquidity profile (order book)
+# ---------------------------------------------------------------------------
+
+DEPTH_BANDS_PCT = (0.005, 0.01, 0.02)  # 0.5%, 1%, 2% either side of mid
+
+
+def liquidity_profile(
+    bids: list[tuple[float, float]], asks: list[tuple[float, float]]
+) -> dict[str, Any]:
+    """
+    Spread and depth estimate from a single order-book snapshot.
+
+    `bids`/`asks` are (price, volume) tuples, any order. Depth is reported as
+    resting USD notional within a few percentage bands of the mid price
+    (0.5%, 1%, 2%), which is a much more direct measure of "can this size
+    actually get filled without moving the price" than open interest or
+    24h volume. This is a snapshot, not a time series, and covers only
+    Kraken's spot book.
+    """
+    if not bids or not asks:
+        return {"available": False, "reason": "Empty order book."}
+
+    best_bid = max(p for p, _ in bids)
+    best_ask = min(p for p, _ in asks)
+    if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
+        return {
+            "available": False,
+            "reason": "Order book is crossed, empty, or otherwise invalid.",
+        }
+
+    mid = (best_bid + best_ask) / 2.0
+    spread_abs = best_ask - best_bid
+    spread_pct = spread_abs / mid * 100.0
+
+    depth_within: dict[str, Any] = {}
+    for band in DEPTH_BANDS_PCT:
+        lo = mid * (1.0 - band)
+        hi = mid * (1.0 + band)
+        bid_usd = sum(p * v for p, v in bids if p >= lo)
+        ask_usd = sum(p * v for p, v in asks if p <= hi)
+        depth_within[f"{band * 100:g}pct"] = {
+            "bid_usd": _round(bid_usd),
+            "ask_usd": _round(ask_usd),
+            "total_usd": _round(bid_usd + ask_usd),
+        }
+
+    total_bid_usd = sum(p * v for p, v in bids)
+    total_ask_usd = sum(p * v for p, v in asks)
+    denom = total_bid_usd + total_ask_usd
+    imbalance = (total_bid_usd - total_ask_usd) / denom if denom > 0 else None
+
+    return {
+        "available": True,
+        "best_bid": _round(best_bid),
+        "best_ask": _round(best_ask),
+        "mid_price": _round(mid),
+        "spread_abs": _round(spread_abs),
+        "spread_percent": _round(spread_pct),
+        "spread_bps": _round(spread_pct * 100.0),
+        "depth_usd_within": depth_within,
+        "book_levels_returned": {"bids": len(bids), "asks": len(asks)},
+        "order_book_imbalance": _round(imbalance) if imbalance is not None else None,
+        "order_book_imbalance_note": (
+            "Resting USD on the bid side minus the ask side, divided by "
+            "their sum, over the levels returned in this snapshot: -1.0 "
+            "(all ask) to +1.0 (all bid). A single-snapshot proxy for "
+            "near-term order-flow pressure, not a trend indicator -- it "
+            "can flip within seconds and says nothing about the next hour."
+        ),
+        "instruction_to_agent": (
+            "A wide spread or thin depth relative to the intended trade size "
+            "means a market order can fill materially worse than the last "
+            "quoted price, and a limit order may sit unfilled. This covers "
+            "only Kraken's spot order book -- it has no visibility into "
+            "futures books, funding, open interest, or off-exchange "
+            "liquidity. Exclude an asset on liquidity grounds when the "
+            "intended position size is a large fraction of the depth within "
+            "the 1% band, not on spread alone."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Market regime (trend / chop / high-vol, with duration)
+# ---------------------------------------------------------------------------
+
+def _efficiency_ratio(close: pd.Series, end_idx: int, window: int) -> tuple[float, bool] | None:
+    """
+    Kaufman's Efficiency Ratio ending at `end_idx` (inclusive, 0-based):
+    net price change over the window divided by the sum of absolute bar-to-bar
+    changes. Near 1.0 means price moved efficiently in one direction
+    (trending); near 0.0 means it churned without net progress (choppy).
+
+    Returns (efficiency_ratio, direction_is_up), or None if `end_idx` is too
+    early to have a full window.
+    """
+    if end_idx < window:
+        return None
+    sub = close.iloc[end_idx - window : end_idx + 1]
+    net = float(sub.iloc[-1] - sub.iloc[0])
+    path = float(sub.diff().abs().sum())
+    er = abs(net) / path if path > 0 else 0.0
+    return er, net >= 0.0
+
+
+def _regime_label_at(
+    close: pd.Series,
+    atr_pct_series: pd.Series,
+    end_idx: int,
+    trend_window: int,
+    vol_lookback: int,
+) -> str | None:
+    """The regime label as of bar `end_idx`, using only data up to and including it."""
+    er_result = _efficiency_ratio(close, end_idx, trend_window)
+    if er_result is None:
+        return None
+    er, direction_up = er_result
+
+    atr_val = atr_pct_series.iloc[end_idx]
+    if pd.isna(atr_val):
+        return None
+    lo = max(0, end_idx - vol_lookback + 1)
+    hist = atr_pct_series.iloc[lo : end_idx + 1].dropna()
+    vol_label = None
+    if len(hist) >= 20:
+        percentile = float((hist <= atr_val).mean())
+        if percentile >= 0.85:
+            vol_label = "high_vol"
+        elif percentile <= 0.15:
+            vol_label = "low_vol"
+
+    if er >= 0.5:
+        trend_part = "trending_up" if direction_up else "trending_down"
+    elif er <= 0.25:
+        trend_part = "choppy"
+    else:
+        trend_part = "mixed"
+
+    return f"{vol_label}_{trend_part}" if vol_label else trend_part
+
+
+def market_regime(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    trend_window: int = 20,
+    vol_lookback: int = 100,
+    max_duration_lookback: int = 90,
+) -> IndicatorResult:
+    """
+    Classify the current regime as trending_up, trending_down, choppy, mixed,
+    or a high_vol/low_vol-prefixed variant, plus how many bars that exact
+    label has persisted.
+
+    Trend/chop comes from Kaufman's Efficiency Ratio over `trend_window` bars
+    (net move / sum of absolute moves -- near 1.0 is an efficient trend, near
+    0.0 is churn with no net progress). Volatility comes from ATR(14) as a
+    percent of price, ranked against its own trailing `vol_lookback` bars
+    (top/bottom 15% -> high_vol/low_vol). Duration walks backward re-deriving
+    the same label bar by bar, capped at `max_duration_lookback` -- a duration
+    equal to that cap is a lower bound, not necessarily the true regime start.
+
+    This exists because get_market_context is stateless: it has no concept of
+    "BTC has been trending down for 11 days" versus "BTC just started
+    breaking down today". Neither classification is a trade signal by
+    itself -- it is context for how much weight to put on a fresh technical
+    signal.
+    """
+    n = len(close)
+    need = trend_window + 20
+    if n < need:
+        return _insufficient(n, need, "market regime")
+
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    tr.iloc[0] = high.iloc[0] - low.iloc[0]
+    atr_series = tr.ewm(alpha=1.0 / 14, adjust=False).mean()
+    atr_pct_series = atr_series / close * 100.0
+
+    current_label = _regime_label_at(close, atr_pct_series, n - 1, trend_window, vol_lookback)
+    if current_label is None:
+        return IndicatorResult(
+            available=False,
+            reason="Not enough converged history to classify the current regime.",
+            bars_used=n,
+        )
+
+    duration = 1
+    limit = min(max_duration_lookback, n - trend_window - 1)
+    duration_is_lower_bound = False
+    for back in range(1, limit + 1):
+        label = _regime_label_at(close, atr_pct_series, n - 1 - back, trend_window, vol_lookback)
+        if label != current_label:
+            break
+        duration += 1
+    else:
+        duration_is_lower_bound = duration >= max_duration_lookback
+
+    er_result = _efficiency_ratio(close, n - 1, trend_window)
+    er_val = round(er_result[0], 3) if er_result else None
+
+    return IndicatorResult(
+        value={
+            "regime": current_label,
+            "duration_bars": duration,
+            "duration_is_lower_bound": duration_is_lower_bound,
+            "efficiency_ratio": er_val,
+            "efficiency_ratio_window": trend_window,
+            "atr_percent_of_price": _round(float(atr_pct_series.iloc[-1])),
+            "volatility_percentile_lookback_bars": vol_lookback,
+            "note": (
+                "Efficiency Ratio near 1.0 means price is moving efficiently "
+                "in one direction (trending); near 0.0 means it is churning "
+                "without net progress (choppy). high_vol/low_vol prefixes "
+                "mean current ATR%-of-price sits in the top/bottom 15% of "
+                "its own trailing history -- not a directional signal, a "
+                "volatility one. duration_is_lower_bound=true means the "
+                "regime held for the entire lookback window searched, so the "
+                "true start may be earlier."
+            ),
+        },
+        available=True,
+        bars_used=n,
+    )
+
+
+# ---------------------------------------------------------------------------
+# RSI / MACD divergence
+# ---------------------------------------------------------------------------
+
+def _rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
+    """Full Wilder RSI series (see rsi() for the single-value, documented version)."""
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
+    g = avg_gain.to_numpy()
+    l = avg_loss.to_numpy()
+    safe_l = np.where(l == 0.0, 1.0, l)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs = g / safe_l
+        raw = 100.0 - (100.0 / (1.0 + rs))
+    vals = np.where((g == 0.0) & (l == 0.0), 50.0, np.where(l == 0.0, 100.0, raw))
+    return pd.Series(vals, index=close.index)
+
+
+def _macd_histogram_series(
+    close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
+) -> pd.Series:
+    """Full MACD histogram series (see macd() for the single-value, documented version)."""
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line - signal_line
+
+
+def detect_divergence(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    left: int = 3,
+    right: int = 3,
+    lookback: int = 180,
+) -> IndicatorResult:
+    """
+    Regular divergence between price and RSI(14) / the MACD(12,26,9)
+    histogram, checked at the two most recent CONFIRMED swing points.
+
+    Bearish: price makes a higher high while the indicator makes a lower
+    high (momentum is fading even as price pushes up). Bullish: price makes
+    a lower low while the indicator makes a higher low (selling pressure is
+    fading even as price pushes down). Checked independently against RSI and
+    against the MACD histogram, since they can disagree.
+
+    RSI/MACD are computed over the asset's full available history so their
+    values are properly converged, then read back at the swing-point bars
+    that fall within `lookback`. Swing points within the most recent `right`
+    bars are excluded as unconfirmed -- a divergence forming right now will
+    not appear until it confirms.
+    """
+    n = len(close)
+    need = left + right + 1 + 35  # + rough MACD/RSI convergence floor
+    if n < need:
+        return _insufficient(n, need, "divergence detection")
+
+    window = min(lookback, n)
+    offset = n - window
+    h_win = high.iloc[-window:].reset_index(drop=True)
+    l_win = low.iloc[-window:].reset_index(drop=True)
+
+    rsi_full = _rsi_series(close, 14)
+    macd_hist_full = _macd_histogram_series(close, 12, 26, 9)
+
+    def rsi_at(local_idx: int) -> float | None:
+        v = rsi_full.iloc[offset + local_idx]
+        return float(v) if pd.notna(v) else None
+
+    def macd_at(local_idx: int) -> float | None:
+        v = macd_hist_full.iloc[offset + local_idx]
+        return float(v) if pd.notna(v) else None
+
+    highs, lows = _swing_points(h_win, l_win, left, right)
+    if len(highs) < 2 and len(lows) < 2:
+        return IndicatorResult(
+            available=False,
+            reason=(
+                "Fewer than two confirmed swing highs or lows in the "
+                f"lookback window ({window} bars)."
+            ),
+            bars_used=n,
+        )
+
+    bearish: dict[str, Any] = {"rsi": {"detected": False}, "macd": {"detected": False}}
+    bullish: dict[str, Any] = {"rsi": {"detected": False}, "macd": {"detected": False}}
+
+    if len(highs) >= 2:
+        prev_h, last_h = highs[-2], highs[-1]
+        higher_high = last_h["price"] > prev_h["price"]
+        r_last, r_prev = rsi_at(last_h["index"]), rsi_at(prev_h["index"])
+        m_last, m_prev = macd_at(last_h["index"]), macd_at(prev_h["index"])
+        if higher_high and r_last is not None and r_prev is not None and r_last < r_prev:
+            bearish["rsi"] = {
+                "detected": True,
+                "prior_swing_high": {"price": _round(prev_h["price"]), "rsi": _round(r_prev)},
+                "latest_swing_high": {"price": _round(last_h["price"]), "rsi": _round(r_last)},
+            }
+        if higher_high and m_last is not None and m_prev is not None and m_last < m_prev:
+            bearish["macd"] = {
+                "detected": True,
+                "prior_swing_high": {"price": _round(prev_h["price"]), "macd_histogram": _round(m_prev)},
+                "latest_swing_high": {"price": _round(last_h["price"]), "macd_histogram": _round(m_last)},
+            }
+
+    if len(lows) >= 2:
+        prev_l, last_l = lows[-2], lows[-1]
+        lower_low = last_l["price"] < prev_l["price"]
+        r_last, r_prev = rsi_at(last_l["index"]), rsi_at(prev_l["index"])
+        m_last, m_prev = macd_at(last_l["index"]), macd_at(prev_l["index"])
+        if lower_low and r_last is not None and r_prev is not None and r_last > r_prev:
+            bullish["rsi"] = {
+                "detected": True,
+                "prior_swing_low": {"price": _round(prev_l["price"]), "rsi": _round(r_prev)},
+                "latest_swing_low": {"price": _round(last_l["price"]), "rsi": _round(r_last)},
+            }
+        if lower_low and m_last is not None and m_prev is not None and m_last > m_prev:
+            bullish["macd"] = {
+                "detected": True,
+                "prior_swing_low": {"price": _round(prev_l["price"]), "macd_histogram": _round(m_prev)},
+                "latest_swing_low": {"price": _round(last_l["price"]), "macd_histogram": _round(m_last)},
+            }
+
+    any_detected = any(
+        d[k]["detected"] for d in (bearish, bullish) for k in ("rsi", "macd")
+    )
+
+    return IndicatorResult(
+        value={
+            "bearish": bearish,
+            "bullish": bullish,
+            "any_divergence_detected": any_detected,
+            "confirmed_swing_highs_in_window": len(highs),
+            "confirmed_swing_lows_in_window": len(lows),
+            "lookback_bars": window,
+            "note": (
+                "Regular divergence only, at the two most recent CONFIRMED "
+                "swing points (the most recent "
+                f"{right} bars are excluded as unconfirmed). One of the more "
+                "reliable reversal signals available from this data, but "
+                "still supporting evidence for the decision hierarchy, not a "
+                "standalone trade trigger."
+            ),
+        },
+        available=True,
+        bars_used=n,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Cross-asset correlation
 # ---------------------------------------------------------------------------
 
