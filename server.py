@@ -25,6 +25,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 import datasource as ds
 import indicators as ind
+import crosssection as cx
 
 # FastMCP auto-enables "DNS rebinding protection" whenever it thinks it is
 # bound to localhost, and that protection only accepts a Host header of
@@ -686,6 +687,58 @@ def detect_divergence(symbol: str, timeframe: str = "1d") -> dict[str, Any]:
         return _error(str(exc), symbol=symbol)
     except Exception as exc:  # noqa: BLE001
         return _error(f"{type(exc).__name__}: {exc}", symbol=symbol)
+
+
+@mcp.tool()
+def scan_universe(symbols: list[str]) -> dict[str, Any]:
+    """
+    Rank an entire eligible universe against itself in one call, and return
+    the handful of assets worth a full deep dive.
+
+    Every other tool here looks at one asset in isolation. This one is
+    cross-sectional: it answers "how is this asset doing relative to every
+    other asset I could buy instead", which is the question that actually
+    decides where limited capital goes. For each asset it returns 1/3/7/30-day
+    returns, performance against BTC and ETH over matching windows,
+    volatility-adjusted momentum, a composite relative-strength percentile,
+    and -- the part conventional indicators cannot give you -- how that
+    percentile has MOVED over the last one and three days, and whether that
+    movement is accelerating. An asset climbing from mid-pack toward the top
+    decile often reflects capital rotating in before the chart looks extended.
+
+    It also returns each asset's volatility state (Bollinger bandwidth and ATR
+    as percentiles of the asset's OWN recent history, range contraction, and
+    whether a compressed state has begun expanding on rising volume), plus a
+    market-level breadth snapshot built from the universe itself -- percent
+    above the 20/50-day MA, percent positive over 7 days, percent beating BTC,
+    median RSI -- with the one-day change in each, so a BTC-led move can be
+    told apart from broad participation.
+
+    Historical ranks are RECOMPUTED from candle history truncated to the bars
+    that had closed at that time, never read from stored state. There is no
+    database, nothing to go stale across a restart, and no way for a metric to
+    see a bar that had not yet closed.
+
+    THIS IS A CANDIDATE-PROMOTION LAYER, NOT A SIGNAL. A promoted asset has
+    earned a deep dive and nothing more. Every existing gate -- the technical
+    thesis, validate_trade_setup, execution preview, liquidity, correlation,
+    churn, drawdown, and portfolio risk -- applies afterwards, unchanged. An
+    asset is promoted only when at least two independent categories agree, and
+    the specific reasons are returned so a promotion can be audited rather
+    than taken on trust.
+
+    Args:
+        symbols: The eligible universe to rank, e.g. ["BTC", "ETH", "SOL", ...].
+            Include "BTC"; it anchors every relative measurement, and the scan
+            returns an error rather than partial results without it. At most 60
+            symbols per call, to stay within the upstream rate limit.
+    """
+    try:
+        return cx.scan_universe(symbols)
+    except ds.DataSourceError as exc:
+        return _error(str(exc))
+    except Exception as exc:  # noqa: BLE001
+        return _error(f"{type(exc).__name__}: {exc}")
 
 
 # ---------------------------------------------------------------------------

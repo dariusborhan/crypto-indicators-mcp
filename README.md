@@ -109,6 +109,7 @@ When running over HTTP the MCP endpoint is at **`/mcp`**, and there is a
 | `get_liquidity_profile(symbol, depth)` | Live order-book spread and depth snapshot (0.5%/1%/2% bands), to catch assets whose indicators compute but whose venue barely trades them. |
 | `get_regime(symbol, timeframe)` | Trend/chop/high-vol label plus how many bars it has persisted — `get_market_context` has no memory of this by itself. |
 | `detect_divergence(symbol, timeframe)` | Regular bullish/bearish divergence between price and RSI/MACD at the last two confirmed swing points. |
+| `scan_universe(symbols)` | Cross-sectional pass over the whole eligible universe: relative-strength percentile per asset, how that percentile has moved over 1 and 3 days and whether it is accelerating, each asset's volatility state, a market breadth snapshot, and a promoted-candidate shortlist with its reasons. Promotion selects assets for a deep dive; it is never a signal and relaxes no gate. |
 | `list_tradeable_symbols(search)` | Symbols with market data available. |
 
 ### Indicators computed
