@@ -34,3 +34,25 @@ Clarify the failed-read rule to say:
 
 > If full journal validation fails, make no journal modification other than clearing the `run_lock` created by this run. Do not trade or overwrite state derived from the failed read.
 
+## 6. Universe discovery must not go through `list_tradeable_symbols`
+
+`list_tradeable_symbols` (`datasource.list_symbols`) has no pagination and silently caps at 60 results, alphabetically. On a raw Robinhood catalog of 90+ symbols it was truncating the eligible universe before `scan_universe` ever ran. `scan_universe` itself now accepts up to 120 symbols per call (raised from 60) and resolves availability itself via `fetch_failures`, so there is no reason to pre-filter with `list_tradeable_symbols` at all.
+
+Replace steps 1-4 of "BUILD THE FULL UNIVERSE EACH RUN" with:
+
+> 1. Call `get_currency_pairs` (or equivalent Robinhood tool) to get the full list of cryptocurrencies Robinhood actually lets this account trade. Record the raw count and the full base-symbol list (e.g. "BTC-USD" -> "BTC").
+> 2. Apply the permitted-universe exclusions to that raw list, using explicit, restatable criteria — this is a judgment about asset class (stablecoin, meme/micro-cap, leveraged/derivative, not spot-tradeable) that only Robinhood's own catalog data can answer, so do it BEFORE involving the indicators connector at all. Name which specific criterion applied per exclusion. The result is the STRATEGY-ELIGIBLE LIST for this cycle. Include BTC even though it may be used primarily as the benchmark.
+> 3. Call `scan_universe` ONCE, passing the entire strategy-eligible list as symbols, with `detail="summary"` and no separate availability pre-check first — do NOT call `list_tradeable_symbols` as a filtering step; it only returns a partial, alphabetically-truncated slice of what has Kraken data and will not reflect the true availability of most of the universe. `scan_universe` resolves each symbol against Kraken itself and reports exactly which ones it could not fetch, with a reason, in `fetch_failures`. It accepts up to 120 symbols per call, comfortably above the full size of a typical brokerage crypto catalog; if the strategy-eligible list somehow still exceeds that, `scan_universe` returns an explicit error naming the count and the limit rather than silently truncating — in that case drop the lowest-liquidity names to fit and record that as an additional, named exclusion criterion in the funnel report.
+> 4. Read the response: `fetch_failures` is the "Lacked reliable Kraken/indicator data" bucket for this cycle — record each symbol with the reason the tool gave, don't guess at one. The symbols actually fetched (requested minus `fetch_failures`) are the FINAL ELIGIBLE UNIVERSE actually screened this cycle. Do not manually reproduce `scan_universe`'s ranks, z-scores, breadth, correlations, or candidate-priority arithmetic.
+
+And update the funnel-reporting bullets to:
+
+> - Robinhood catalog: \<raw count\>
+> - Excluded by strategy rules, broken down by specific criterion: \<counts\>
+> - Lacked reliable Kraken/indicator data: \<count, symbols + reason from scan_universe's fetch_failures\>
+> - Final eligible universe (what scan_universe actually fetched): \<count\>
+> - Recommended deep dives: \<count and symbols, with candidate_priority for each\>
+> - Full deep dives actually completed: \<count and symbols\>
+
+This patch also required a code change already included in this repo: `crosssection.scan_universe`'s `max_symbols` default was raised from 60 to 120 so a full post-exclusion universe fits in one call.
+

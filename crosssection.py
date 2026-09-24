@@ -871,7 +871,7 @@ def _suppressed_categories(
 # ---------------------------------------------------------------------------
 
 def scan_universe(
-    symbols: list[str], detail: str = "summary", max_symbols: int = 60
+    symbols: list[str], detail: str = "summary", max_symbols: int = 120
 ) -> dict[str, Any]:
     """
     Run the full cross-sectional pass over an eligible universe.
@@ -882,6 +882,15 @@ def scan_universe(
     enough to read mid-run. detail="full" adds every per-asset measurement,
     which runs to tens of thousands of tokens on a real universe -- use it for
     inspection, not inside a scheduled run.
+
+    max_symbols defaults to 120 -- comfortably above the ~90-symbol size of a
+    typical brokerage's full crypto catalog, so a caller building "the entire
+    permitted universe minus exclusions" in one pass does not get truncated
+    or rejected mid-run. Fetches are threaded (_MAX_WORKERS=4) and each hits
+    only Kraken's public, unauthenticated OHLC endpoint, so the wall-clock
+    cost of a larger universe is longer scan time, not rate-limit risk. The
+    cap still exists to catch a caller accidentally passing an unfiltered
+    exchange-wide symbol list.
     """
     if detail not in ("summary", "full"):
         return {"error": "detail must be 'summary' or 'full'."}

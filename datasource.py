@@ -159,12 +159,24 @@ def _load_pairs(force: bool = False) -> dict[str, Any]:
     return result
 
 
+# Kraken assigns a handful of assets a wsname/base ticker that differs from
+# the ticker used everywhere else (brokerages, CoinGecko, etc). Dogecoin is
+# the clear case: Kraken's own wsname is still "XDG/USD", not "DOGE/USD", so
+# without this table DOGE silently fails to resolve on every call. Extend
+# this table as other mismatches turn up (run every Robinhood symbol through
+# resolve_pair() and log failures to find them).
+_SYMBOL_ALIASES: dict[str, str] = {
+    "DOGE": "XDG",
+}
+_REVERSE_ALIASES: dict[str, str] = {v: k for k, v in _SYMBOL_ALIASES.items()}
+
+
 def _normalize_base(symbol: str) -> str:
     s = symbol.strip().upper()
     # Kraken calls Bitcoin XBT. Accept the name everyone else uses.
     if s in ("BTC", "XBT"):
         return "XBT"
-    return s
+    return _SYMBOL_ALIASES.get(s, s)
 
 
 def resolve_pair(symbol: str) -> str:
@@ -236,7 +248,7 @@ def list_symbols(search: str | None = None, limit: int = 60) -> list[dict[str, s
             continue
         wsname = str(info.get("wsname", name))
         base = wsname.split("/")[0] if "/" in wsname else str(info.get("base", ""))
-        display = "BTC" if base in ("XBT", "XXBT") else base
+        display = "BTC" if base in ("XBT", "XXBT") else _REVERSE_ALIASES.get(base.upper(), base)
         if search and search.strip().upper() not in display.upper():
             continue
         out.append({"symbol": display, "kraken_pair": name, "wsname": wsname})

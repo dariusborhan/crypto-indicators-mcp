@@ -288,9 +288,12 @@ try:
     check("summary omits the per-asset block", "assets" not in out)
     check("leaderboard covers every fetched asset",
           len(out["leaderboard"]) == out["fetched"])
-    check("leaderboard is sorted by percentile",
-          [r["percentile"] for r in out["leaderboard"]]
-          == sorted([r["percentile"] for r in out["leaderboard"]], reverse=True))
+    # The leaderboard is deliberately sorted by candidate_priority (the deep-dive
+    # queue's own ranking), not by raw percentile -- see scan_universe's
+    # leaderboard.sort(...) call and the deep_dive_policy field.
+    check("leaderboard is sorted by candidate_priority",
+          [r["candidate_priority"] for r in out["leaderboard"]]
+          == sorted([r["candidate_priority"] for r in out["leaderboard"]], reverse=True))
     check("promoted list respects the cap",
           len(out["promoted_candidates"]) <= cs.MAX_PROMOTED,
           f"{len(out['promoted_candidates'])} of max {cs.MAX_PROMOTED}")
@@ -340,7 +343,7 @@ finally:
 
 print("\n=== 11. input guardrails ===")
 check("empty universe refused", "error" in cs.scan_universe([]))
-check("oversized universe refused", "error" in cs.scan_universe(["BTC"] * 61))
+check("oversized universe refused", "error" in cs.scan_universe(["BTC"] * 121))
 
 print("\n=== top 5 by composite percentile ===")
 rows = [(s, d["composite_percentile"], d["rank_change_3d"], d["rank_acceleration"])
