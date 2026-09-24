@@ -690,7 +690,7 @@ def detect_divergence(symbol: str, timeframe: str = "1d") -> dict[str, Any]:
 
 
 @mcp.tool()
-def scan_universe(symbols: list[str]) -> dict[str, Any]:
+def scan_universe(symbols: list[str], detail: str = "summary") -> dict[str, Any]:
     """
     Rank an entire eligible universe against itself in one call, and return
     the handful of assets worth a full deep dive.
@@ -722,19 +722,30 @@ def scan_universe(symbols: list[str]) -> dict[str, Any]:
     THIS IS A CANDIDATE-PROMOTION LAYER, NOT A SIGNAL. A promoted asset has
     earned a deep dive and nothing more. Every existing gate -- the technical
     thesis, validate_trade_setup, execution preview, liquidity, correlation,
-    churn, drawdown, and portfolio risk -- applies afterwards, unchanged. An
-    asset is promoted only when at least two independent categories agree, and
-    the specific reasons are returned so a promotion can be audited rather
-    than taken on trust.
+    churn, drawdown, and portfolio risk -- applies afterwards, unchanged.
+
+    Promotion is deliberately hard to earn. Relative strength GATES it (an
+    asset below the universe median is never promoted, whatever else fires),
+    at least two further categories must agree, thresholds are drawn from this
+    scan's own distribution rather than fixed ratios, any category firing on
+    more than a third of the universe is suppressed as describing the regime
+    rather than the asset, and the shortlist is capped. The specific reasons
+    are returned so a promotion can be audited rather than taken on trust.
 
     Args:
         symbols: The eligible universe to rank, e.g. ["BTC", "ETH", "SOL", ...].
             Include "BTC"; it anchors every relative measurement, and the scan
             returns an error rather than partial results without it. At most 60
             symbols per call, to stay within the upstream rate limit.
+        detail: "summary" (default) returns breadth, the promoted shortlist
+            with reasons, and a one-line-per-asset leaderboard -- everything
+            needed to choose deep-dive candidates, small enough to read inside
+            a scheduled run. "full" adds every per-asset measurement and runs
+            to tens of thousands of tokens on a real universe; use it for
+            inspection, not in a run.
     """
     try:
-        return cx.scan_universe(symbols)
+        return cx.scan_universe(symbols, detail=detail)
     except ds.DataSourceError as exc:
         return _error(str(exc))
     except Exception as exc:  # noqa: BLE001

@@ -9,6 +9,7 @@ Run from the repo root:  python test_crosssection.py
 """
 from __future__ import annotations
 
+import json
 import sys
 
 import numpy as np
@@ -228,24 +229,29 @@ check("classification is a known label",
       f"{br['classification']} ({br['classification_rule']})")
 check("rotation reported", br["rotation"] is not None, str(br["rotation"]))
 
-print("\n=== 8. promotion requires agreement across categories ===")
-for sym, d in A.items():
-    v = cs.volatility_state(U[sym])
-    p = cs._promotion_for(sym, d, v)
-    if p["promote"]:
-        check(f"promoted {sym} met >=2 categories", len(p["categories"]) >= 2,
-              str(p["categories"]))
-        check(f"promoted {sym} gave reasons", len(p["reasons"]) >= 2, str(p["reasons"]))
-lonely = cs._promotion_for(
-    "X",
-    {"rankable": True, "composite_percentile": 99.0, "rank_acceleration": 0.0,
-     "rank_change_3d": 0.0, "returns_percent": {"7d": 3.0}},
-    {"available": False},
-)
-check("a single strong category does not promote", lonely["promote"] is False,
-      str(lonely["categories"]))
-unrankable = cs._promotion_for("Y", {"rankable": False}, {"available": True})
-check("unrankable asset is never promoted", unrankable["promote"] is False)
+print("\n=== 8. promotion: gate, agreement, suppression, cap ===")
+out8 = cs.scan_universe.__wrapped__ if hasattr(cs.scan_universe, "__wrapped__") else None
+# Flags are computed per asset against a volume bar drawn from the scan.
+vol_states = {s: cs.volatility_state(d) for s, d in U.items()}
+bar = cs._volume_bar(vol_states)
+check("volume bar respects the absolute floor", bar >= cs.VOLUME_ABSOLUTE_FLOOR, f"bar={bar}")
+
+raw = {}
+for s in U:
+    f, _ = cs._signal_flags(A[s], vol_states[s], bar)
+    raw[s] = f
+sup = cs._suppressed_categories(raw, len(U))
+for cat, info in sup.items():
+    check(f"suppressed {cat} fired on >{cs.COMMON_SIGNAL_FRACTION:.0%}",
+          info["fraction"] > cs.COMMON_SIGNAL_FRACTION, str(info["fraction"]))
+
+# A category firing on everything must be suppressed; one firing rarely must not.
+everywhere = {s: {"volume": True} for s in U}
+check("a category firing on the whole universe is suppressed",
+      "volume" in cs._suppressed_categories(everywhere, len(U)))
+rare = {s: ({"volume": True} if i == 0 else {}) for i, s in enumerate(U)}
+check("a rarely-firing category survives",
+      "volume" not in cs._suppressed_categories(rare, len(U)))
 
 print("\n=== 9. fetch failures are surfaced, not swallowed ===")
 cs._frame_cache.clear()
@@ -278,13 +284,50 @@ try:
     cs._frame_cache.clear()
     out = cs.scan_universe(list(U.keys()))
     check("scan succeeded", "error" not in out, out.get("error", ""))
-    check("asset count matches fetch count", len(out["assets"]) == out["fetched"])
-    check("every promoted candidate met >=2 categories",
-          all(len(p["categories"]) >= 2 for p in out["promoted_candidates"]))
+    check("summary is the default", out["detail"] == "summary")
+    check("summary omits the per-asset block", "assets" not in out)
+    check("leaderboard covers every fetched asset",
+          len(out["leaderboard"]) == out["fetched"])
+    check("leaderboard is sorted by percentile",
+          [r["percentile"] for r in out["leaderboard"]]
+          == sorted([r["percentile"] for r in out["leaderboard"]], reverse=True))
+    check("promoted list respects the cap",
+          len(out["promoted_candidates"]) <= cs.MAX_PROMOTED,
+          f"{len(out['promoted_candidates'])} of max {cs.MAX_PROMOTED}")
+    check("every promoted asset met the agreement requirement",
+          all(len(p["categories"]) >= cs.REQUIRED_CATEGORIES
+              for p in out["promoted_candidates"]))
+
+    # The exact regression the first live scan exposed: weak assets promoted
+    # on volatility and volume alone.
+    check("no asset below the strength gate is promoted",
+          all(p["composite_percentile"] >= cs.MIN_PROMOTION_PERCENTILE
+              for p in out["promoted_candidates"]),
+          str([(p["symbol"], p["composite_percentile"]) for p in out["promoted_candidates"]]))
+    weak = [r for r in out["leaderboard"]
+            if r["percentile"] is not None and r["percentile"] < cs.MIN_PROMOTION_PERCENTILE]
+    check("weak half of the universe is all blocked",
+          all(r["promoted"] is False for r in weak), f"{len(weak)} weak assets")
+    check("promoted share is a shortlist, not half the universe",
+          len(out["promoted_candidates"]) <= out["fetched"] // 3,
+          f"{len(out['promoted_candidates'])}/{out['fetched']}")
+
     check("data limitations stated", len(out["data_limitations"]) >= 3)
     check("method documents the no-persistence approach",
           "Recomputed" in out["method"]["historical_ranks"])
+    check("promotion rules report the scan's volume bar",
+          out["promotion_rules"]["volume_bar_this_scan"] is not None)
+
+    cs._frame_cache.clear()
+    full = cs.scan_universe(list(U.keys()), detail="full")
+    check("full detail includes the per-asset block", "assets" in full)
+    check("full detail covers every asset", len(full["assets"]) == full["fetched"])
+    check("summary payload is far smaller than full",
+          len(json.dumps(out)) * 3 < len(json.dumps(full)),
+          f"summary={len(json.dumps(out))}B full={len(json.dumps(full))}B")
+    check("bad detail value refused", "error" in cs.scan_universe(["BTC"], detail="verbose"))
     print(f"  promoted: {[p['symbol'] for p in out['promoted_candidates']]}")
+    print(f"  suppressed: {list((out['promotion_rules']['suppressed_categories'] or {}).keys())}")
     print(f"  breadth:  {out['market_breadth']['classification']}"
           f" / {out['market_breadth']['rotation']}")
 

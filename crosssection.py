@@ -652,82 +652,144 @@ def market_breadth(frames: dict[str, pd.DataFrame]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Candidate promotion
 # ---------------------------------------------------------------------------
+#
+# Two lessons from the first live scan, which promoted 19 of 35 assets --
+# including two in the bottom sixth of the universe -- when the intent was a
+# handful of the strongest:
+#
+#   1. RELATIVE STRENGTH IS A GATE, NOT A VOTE. Scoring "percentile >= 70" as
+#      a category guarantees that 30% of the universe fires it on every scan,
+#      by definition, because a percentile is a rank. It now gates promotion
+#      instead: nothing below the universe median can be promoted at all. A
+#      long-only account should not spend a deep dive on the weakest names.
+#
+#   2. THRESHOLDS MUST BE RELATIVE TO THE SCAN, NOT ABSOLUTE. On a day when
+#      the whole market is expanding, an absolute rule like "volume >= 1.4x"
+#      fires on half the universe and carries no information. Two defences:
+#      the volume bar is set from this scan's own distribution, and any
+#      category firing on more than a set fraction of the universe is
+#      suppressed entirely for that scan and reported as non-discriminating.
+#      A signal shared by half the market is a description of the market, not
+#      a reason to single an asset out.
 
-# Promotion requires agreement across independent categories, so no single
-# measure can push an asset forward on its own.
-STRONG_PERCENTILE = 70.0
+# An asset below this universe percentile is never promoted, whatever else
+# fires. A genuine rotation crosses the median quickly, and the universe is
+# scanned three times a day, so this still catches it early.
+MIN_PROMOTION_PERCENTILE = 50.0
+
+# A category firing on more than this fraction of the universe is suppressed
+# for the scan: it is describing the regime, not distinguishing an asset.
+COMMON_SIGNAL_FRACTION = 0.35
+
+# Independent categories that must agree before an asset is promoted.
+REQUIRED_CATEGORIES = 2
+
+# Hard cap on the shortlist, ranked by composite percentile.
+MAX_PROMOTED = 6
+
 ACCELERATION_THRESHOLD = 8.0
 RANK_CHANGE_THRESHOLD = 10.0
-VOLUME_ANOMALY_RATIO = 1.4
+
+# The volume bar is the higher of this scan's upper quartile and this floor,
+# so a flat market cannot make an ordinary 1.05x reading look unusual.
+VOLUME_PERCENTILE_CUTOFF = 75.0
+VOLUME_ABSOLUTE_FLOOR = 1.2
 
 
-def _promotion_for(
-    sym: str, strength: dict[str, Any], vol: dict[str, Any]
-) -> dict[str, Any]:
-    reasons: list[str] = []
-    categories: set[str] = set()
-
+def _signal_flags(
+    strength: dict[str, Any], vol: dict[str, Any], volume_bar: float
+) -> tuple[dict[str, bool], dict[str, str]]:
+    """Raw category flags for one asset, before universe-wide suppression."""
+    flags: dict[str, bool] = {}
+    why: dict[str, str] = {}
     if not strength.get("rankable"):
-        return {"promote": False, "categories_met": 0, "reasons": [], "eligible": False}
+        return flags, why
 
-    pctl = strength.get("composite_percentile")
     accel = strength.get("rank_acceleration")
     chg3 = strength.get("rank_change_3d")
-
-    if pctl is not None and pctl >= STRONG_PERCENTILE:
-        reasons.append(f"relative-strength percentile {pctl:.0f} (top of universe)")
-        categories.add("relative_strength")
     if accel is not None and accel >= ACCELERATION_THRESHOLD:
-        reasons.append(f"rank acceleration +{accel:.0f} (climb is steepening)")
-        categories.add("rank_trajectory")
+        flags["rank_trajectory"] = True
+        why["rank_trajectory"] = f"rank acceleration +{accel:.0f} (climb is steepening)"
     elif chg3 is not None and chg3 >= RANK_CHANGE_THRESHOLD:
-        reasons.append(f"rank improved {chg3:.0f} percentile points over 3 days")
-        categories.add("rank_trajectory")
+        flags["rank_trajectory"] = True
+        why["rank_trajectory"] = f"rank improved {chg3:.0f} percentile points over 3 days"
 
     if vol.get("available"):
         if vol.get("compression_expansion_transition"):
-            reasons.append("volatility expanding out of a compressed state on rising volume")
-            categories.add("volatility_state")
+            flags["volatility_state"] = True
+            why["volatility_state"] = (
+                "volatility expanding out of a compressed state on rising volume"
+            )
         vr = vol.get("volume_5d_vs_20d")
-        if vr is not None and vr >= VOLUME_ANOMALY_RATIO:
-            reasons.append(f"5-day volume {vr:.2f}x its 20-day average")
-            categories.add("volume")
+        if vr is not None and vr >= volume_bar:
+            flags["volume"] = True
+            why["volume"] = (
+                f"5-day volume {vr:.2f}x its 20-day average "
+                f"(scan bar {volume_bar:.2f}x)"
+            )
+    return flags, why
 
-    # The pattern the spec singles out: strength building without the price
-    # move having become extreme yet.
-    r7 = (strength.get("returns_percent") or {}).get("7d")
-    if (
-        "volume" in categories
-        and pctl is not None
-        and pctl >= 60.0
-        and r7 is not None
-        and abs(r7) < 10.0
-    ):
-        reasons.append(
-            "unusual volume and firm relative strength without an extreme price move yet"
-        )
-        categories.add("early_signature")
 
-    return {
-        "promote": len(categories) >= 2,
-        "categories_met": len(categories),
-        "categories": sorted(categories),
-        "reasons": reasons,
-        "eligible": True,
-    }
+def _volume_bar(vol_states: dict[str, dict[str, Any]]) -> float:
+    """The volume ratio an asset must beat, set from this scan's spread."""
+    ratios = [
+        float(v["volume_5d_vs_20d"])
+        for v in vol_states.values()
+        if v.get("available") and v.get("volume_5d_vs_20d") is not None
+    ]
+    if len(ratios) < 8:
+        return VOLUME_ABSOLUTE_FLOOR
+    return max(
+        float(np.percentile(np.asarray(ratios, dtype=float), VOLUME_PERCENTILE_CUTOFF)),
+        VOLUME_ABSOLUTE_FLOOR,
+    )
+
+
+def _suppressed_categories(
+    raw: dict[str, dict[str, bool]], universe_size: int
+) -> dict[str, dict[str, Any]]:
+    """Categories so widely fired this scan that they no longer discriminate."""
+    out: dict[str, dict[str, Any]] = {}
+    if universe_size <= 0:
+        return out
+    for cat in ("rank_trajectory", "volatility_state", "volume"):
+        fired = sum(1 for f in raw.values() if f.get(cat))
+        fraction = fired / universe_size
+        if fraction > COMMON_SIGNAL_FRACTION:
+            out[cat] = {
+                "fired_on": fired,
+                "of": universe_size,
+                "fraction": ind._round(fraction, 3),
+                "reason": (
+                    "Fired on more than "
+                    f"{COMMON_SIGNAL_FRACTION:.0%} of the universe, so it describes "
+                    "current market conditions rather than distinguishing an asset. "
+                    "Ignored for promotion this scan."
+                ),
+            }
+    return out
+
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def scan_universe(symbols: list[str], max_symbols: int = 60) -> dict[str, Any]:
+def scan_universe(
+    symbols: list[str], detail: str = "summary", max_symbols: int = 60
+) -> dict[str, Any]:
     """
     Run the full cross-sectional pass over an eligible universe.
 
-    Returns per-asset relative strength, rank trajectory, volatility state and
-    promotion reasons, plus a market-level breadth snapshot.
+    detail="summary" (the default) returns the breadth snapshot, the promoted
+    shortlist with its reasons, and a one-line-per-asset leaderboard. That is
+    what an agent needs to decide where to deep-dive, and it stays small
+    enough to read mid-run. detail="full" adds every per-asset measurement,
+    which runs to tens of thousands of tokens on a real universe -- use it for
+    inspection, not inside a scheduled run.
     """
+    if detail not in ("summary", "full"):
+        return {"error": "detail must be 'summary' or 'full'."}
     if not symbols:
         return {"error": "No symbols supplied. Pass the eligible universe."}
     if len(symbols) > max_symbols:
@@ -754,39 +816,111 @@ def scan_universe(symbols: list[str], max_symbols: int = 60) -> dict[str, Any]:
 
     strength = cross_sectional_strength(frames)
     breadth = market_breadth(frames)
+    vol_states = {sym: volatility_state(df) for sym, df in frames.items()}
 
-    assets: dict[str, Any] = {}
-    promoted: list[dict[str, Any]] = []
-    for sym in sorted(frames):
+    # Pass 1: raw flags for every asset, against a volume bar drawn from this
+    # scan's own distribution rather than a fixed ratio.
+    volume_bar = _volume_bar(vol_states)
+    raw_flags: dict[str, dict[str, bool]] = {}
+    raw_why: dict[str, dict[str, str]] = {}
+    for sym in frames:
+        f, w = _signal_flags(strength["assets"].get(sym, {}), vol_states[sym], volume_bar)
+        raw_flags[sym], raw_why[sym] = f, w
+
+    # Pass 2: drop categories that fired so widely they describe the regime.
+    suppressed = _suppressed_categories(raw_flags, len(frames))
+
+    # Pass 3: apply the relative-strength gate and the agreement requirement.
+    candidates: list[dict[str, Any]] = []
+    promotion_by_symbol: dict[str, dict[str, Any]] = {}
+    for sym in frames:
         s = strength["assets"].get(sym, {})
-        v = volatility_state(frames[sym])
-        promo = _promotion_for(sym, s, v)
-        assets[sym] = {
-            "bars_available": len(frames[sym]),
-            "relative_strength": s,
-            "volatility_state": v,
-            "promotion": promo,
+        pctl = s.get("composite_percentile")
+        surviving = sorted(c for c in raw_flags[sym] if c not in suppressed)
+        gate_ok = pctl is not None and pctl >= MIN_PROMOTION_PERCENTILE
+
+        blocked = None
+        if not s.get("rankable"):
+            blocked = "not rankable"
+        elif not gate_ok:
+            blocked = (
+                f"below the {MIN_PROMOTION_PERCENTILE:.0f}th relative-strength "
+                f"percentile (at {pctl:.0f})" if pctl is not None else "no composite score"
+            )
+        elif len(surviving) < REQUIRED_CATEGORIES:
+            blocked = (
+                f"{len(surviving)} discriminating category(ies); "
+                f"{REQUIRED_CATEGORIES} required"
+            )
+
+        reasons = [raw_why[sym][c] for c in surviving]
+        # The pattern worth calling out: strength and unusual volume building
+        # before the price move has become extreme. A highlight, not a vote --
+        # it derives from volume, so it does not count toward agreement.
+        r7 = (s.get("returns_percent") or {}).get("7d")
+        if (
+            "volume" in surviving
+            and pctl is not None
+            and pctl >= 60.0
+            and r7 is not None
+            and abs(r7) < 10.0
+        ):
+            reasons.append(
+                "unusual volume and firm relative strength without an extreme "
+                "price move yet"
+            )
+
+        promo = {
+            "promote": blocked is None,
+            "categories": surviving,
+            "reasons": reasons,
+            "blocked_by": blocked,
         }
-        if promo.get("promote"):
-            promoted.append(
+        promotion_by_symbol[sym] = promo
+        if blocked is None:
+            candidates.append(
                 {
                     "symbol": sym,
-                    "composite_percentile": s.get("composite_percentile"),
+                    "composite_percentile": pctl,
                     "rank_acceleration": s.get("rank_acceleration"),
-                    "categories": promo.get("categories"),
-                    "reasons": promo.get("reasons"),
+                    "categories": surviving,
+                    "reasons": reasons,
                 }
             )
 
-    promoted.sort(
-        key=lambda d: (
-            d.get("composite_percentile") if d.get("composite_percentile") is not None else -1
-        ),
+    candidates.sort(
+        key=lambda d: d["composite_percentile"] if d["composite_percentile"] is not None else -1,
         reverse=True,
     )
+    over_cap = max(0, len(candidates) - MAX_PROMOTED)
+    promoted = candidates[:MAX_PROMOTED]
 
-    return {
+    leaderboard = []
+    for sym in frames:
+        s = strength["assets"].get(sym, {})
+        v = vol_states[sym]
+        leaderboard.append(
+            {
+                "symbol": sym,
+                "percentile": s.get("composite_percentile"),
+                "return_7d": (s.get("returns_percent") or {}).get("7d"),
+                "vs_btc_7d": (s.get("vs_btc_percent") or {}).get("7d"),
+                "rank_change_3d": s.get("rank_change_3d"),
+                "rank_acceleration": s.get("rank_acceleration"),
+                "volume_5d_vs_20d": v.get("volume_5d_vs_20d") if v.get("available") else None,
+                "vol_transition": v.get("compression_expansion_transition")
+                if v.get("available")
+                else None,
+                "promoted": promotion_by_symbol[sym]["promote"],
+            }
+        )
+    leaderboard.sort(
+        key=lambda d: d["percentile"] if d["percentile"] is not None else -1, reverse=True
+    )
+
+    result: dict[str, Any] = {
         "source": "Kraken public API, completed daily candles only",
+        "detail": detail,
         "requested": len(symbols),
         "fetched": len(frames),
         "fetch_failures": failures,
@@ -794,22 +928,22 @@ def scan_universe(symbols: list[str], max_symbols: int = 60) -> dict[str, Any]:
         "market_breadth": breadth,
         "promoted_candidates": promoted,
         "promotion_rules": {
-            "requirement": "At least two independent categories must agree.",
-            "categories": [
-                "relative_strength",
-                "rank_trajectory",
-                "volatility_state",
-                "volume",
-                "early_signature",
-            ],
-            "thresholds": {
-                "strong_percentile": STRONG_PERCENTILE,
-                "rank_acceleration": ACCELERATION_THRESHOLD,
-                "rank_change_3d": RANK_CHANGE_THRESHOLD,
-                "volume_ratio_5d_vs_20d": VOLUME_ANOMALY_RATIO,
-            },
+            "gate": (
+                f"Relative-strength percentile must be at least "
+                f"{MIN_PROMOTION_PERCENTILE:.0f}. Strength gates promotion; it is "
+                f"not itself a category, because a percentile threshold would fire "
+                f"on a fixed share of the universe every scan."
+            ),
+            "requirement": (
+                f"At least {REQUIRED_CATEGORIES} discriminating categories must "
+                f"agree: rank_trajectory, volatility_state, volume."
+            ),
+            "volume_bar_this_scan": ind._round(volume_bar, 4),
+            "suppressed_categories": suppressed or None,
+            "cap": MAX_PROMOTED,
+            "candidates_over_cap": over_cap,
         },
-        "assets": assets,
+        "leaderboard": leaderboard,
         "method": strength["method"],
         "data_limitations": [
             "Kraken spot only. No funding rates, open interest, or futures positioning.",
@@ -821,3 +955,15 @@ def scan_universe(symbols: list[str], max_symbols: int = 60) -> dict[str, Any]:
             "a weak market is still a weak asset in absolute terms.",
         ],
     }
+
+    if detail == "full":
+        result["assets"] = {
+            sym: {
+                "bars_available": len(frames[sym]),
+                "relative_strength": strength["assets"].get(sym, {}),
+                "volatility_state": vol_states[sym],
+                "promotion": promotion_by_symbol[sym],
+            }
+            for sym in sorted(frames)
+        }
+    return result
