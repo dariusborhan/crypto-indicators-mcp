@@ -182,3 +182,16 @@ for, and why it is the first tool in the list.
 - **Indicators are not signals.** This server deliberately does not emit
   buy/sell recommendations. It returns numbers; the agent does the reasoning,
   which is where your strategy rules apply.
+
+## Quantitative discovery layer (v2)
+
+`scan_universe()` now separates **candidate discovery** from **trade permission**. In addition to cross-sectional relative strength, rank trajectory, volatility state, and breadth, it reports:
+
+- prior-baseline return, volume, and range anomaly z-scores;
+- 20-day vs 60-day BTC correlation and correlation delta;
+- a transparent 0-100 `candidate_priority` decomposed into leadership, emergence, participation, volatility-transition, and independence dimensions;
+- `recommended_deep_dives`, the top three non-BTC candidates on every healthy full scan.
+
+`recommended_deep_dives` is deliberately **not a buy list**. Its purpose is to prevent the orchestration model from subjectively deciding that nothing is worth investigating. Every existing technical, reward-to-risk, liquidity, execution, churn, correlation, drawdown, and portfolio-risk gate still applies after the deep dive.
+
+The trade-math defaults are aligned to the current strategy: 2% normal per-position risk budget and 10% total open-risk cap. Drawdown-band overrides remain explicit caller inputs.

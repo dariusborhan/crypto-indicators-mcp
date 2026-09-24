@@ -1398,7 +1398,7 @@ def suggest_position_size(
     account_equity_usd: float,
     entry_price: float,
     collar_adjusted_stop_price: float,
-    risk_budget_pct: float = 2.5,
+    risk_budget_pct: float = 2.0,
     min_position_usd: float = 50.0,
     max_position_pct: float = 40.0,
 ) -> dict[str, Any]:
@@ -1482,13 +1482,13 @@ def validate_trade_setup(
     account_equity_usd: float,
     current_open_risk_usd: float = 0.0,
     round_trip_cost_pct: float = 0.0,
-    risk_budget_pct: float = 2.5,
+    risk_budget_pct: float = 2.0,
     reward_to_risk_floor: float = 1.5,
     reward_to_risk_exception_floor: float = 1.2,
     allow_exception: bool = False,
     min_position_usd: float = 50.0,
     max_position_pct: float = 40.0,
-    portfolio_risk_cap_pct: float = 8.0,
+    portfolio_risk_cap_pct: float = 10.0,
 ) -> dict[str, Any]:
     """
     A single, hard, external gate that a proposed long spot entry must clear
@@ -1527,7 +1527,7 @@ def validate_trade_setup(
             committed across all other open positions, before this trade.
         round_trip_cost_pct: Estimated round-trip trading cost as a percent
             of notional, from preview_crypto_order.
-        risk_budget_pct: Percent of equity to risk on this trade (2.5 under
+        risk_budget_pct: Percent of equity to risk on this trade (2.0 under
             normal conditions; lower this directly when the drawdown-based
             risk controls call for it).
         reward_to_risk_floor: Hard floor, normally 1.5.
@@ -1539,7 +1539,7 @@ def validate_trade_setup(
         max_position_pct: Position size ceiling as percent of equity,
             normally 40.
         portfolio_risk_cap_pct: Maximum total collar-adjusted open risk
-            across the whole portfolio after this trade, normally 8.
+            across the whole portfolio after this trade, normally 10.
     """
     reasons: list[str] = []
 

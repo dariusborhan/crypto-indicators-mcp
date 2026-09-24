@@ -420,7 +420,7 @@ def suggest_position_size(
     account_equity_usd: float,
     entry_price: float,
     collar_adjusted_stop_price: float,
-    risk_budget_pct: float = 2.5,
+    risk_budget_pct: float = 2.0,
     min_position_usd: float = 50.0,
     max_position_pct: float = 40.0,
 ) -> dict[str, Any]:
@@ -445,7 +445,7 @@ def suggest_position_size(
         collar_adjusted_stop_price: The stop price AFTER collar adjustment
             (stop_trigger_price * 0.95 for a sell stop) -- pass the adjusted
             figure, not the raw trigger.
-        risk_budget_pct: Percent of equity to risk on this trade. Default 2.5;
+        risk_budget_pct: Percent of equity to risk on this trade. Default 2.0;
             pass 1.25 when portfolio drawdown is in the 15-25% band per the
             strategy's risk controls, or use validate_trade_setup instead of
             calling this directly once drawdown is that high.
@@ -470,13 +470,13 @@ def validate_trade_setup(
     account_equity_usd: float,
     current_open_risk_usd: float = 0.0,
     round_trip_cost_pct: float = 0.0,
-    risk_budget_pct: float = 2.5,
+    risk_budget_pct: float = 2.0,
     reward_to_risk_floor: float = 1.5,
     reward_to_risk_exception_floor: float = 1.2,
     allow_exception: bool = False,
     min_position_usd: float = 50.0,
     max_position_pct: float = 40.0,
-    portfolio_risk_cap_pct: float = 8.0,
+    portfolio_risk_cap_pct: float = 10.0,
 ) -> dict[str, Any]:
     """
     The hard, external gate a proposed long spot entry must clear before any
@@ -511,7 +511,7 @@ def validate_trade_setup(
         round_trip_cost_pct: Estimated round-trip trading cost as a percent
             of notional, from preview_crypto_order.
         risk_budget_pct: Percent of equity to risk on this trade. Default
-            2.5; use 1.25 in the 15-25% drawdown band per the strategy, 0
+            2.0; use 1.25 in the 15-25% drawdown band per the strategy, 0
             (which will always fail) above 25% drawdown.
         reward_to_risk_floor: Hard floor absent the documented exception.
             Default 1.5.
@@ -527,7 +527,7 @@ def validate_trade_setup(
         min_position_usd: Position size floor. Default 50.
         max_position_pct: Position size ceiling, percent of equity. Default 40.
         portfolio_risk_cap_pct: Max total collar-adjusted open risk across the
-            whole portfolio after this trade. Default 8.
+            whole portfolio after this trade. Default 10.
     """
     return ind.validate_trade_setup(
         entry_price=entry_price,

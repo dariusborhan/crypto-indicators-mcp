@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py datasource.py indicators.py ./
+COPY server.py datasource.py indicators.py crosssection.py ./
 
 ENV MCP_TRANSPORT=http
 ENV PORT=8000

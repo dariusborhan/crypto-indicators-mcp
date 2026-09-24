@@ -475,9 +475,19 @@ def volatility_state(df: pd.DataFrame) -> dict[str, Any]:
         was_compressed = bool((recent_bw <= q25).any())
 
     expanding = False
-    if len(bw.dropna()) >= 4:
+    expansion_ratio = None
+    atr_expanding = False
+    if len(bw.dropna()) >= 6:
         b = bw.dropna()
+        baseline = float(b.iloc[-6:-1].min())
+        current_bw = float(b.iloc[-1])
+        expansion_ratio = current_bw / baseline if baseline > 1e-12 else None
+        # Keep the release detector sensitive; the magnitude is exposed
+        # separately so candidate priority can distinguish weak from strong releases.
         expanding = bool(float(b.iloc[-1]) > float(b.iloc[-4]))
+    if len(atrp.dropna()) >= 4:
+        a = atrp.dropna()
+        atr_expanding = bool(float(a.iloc[-1]) > float(a.iloc[-4]))
 
     transition = bool(
         was_compressed
@@ -485,6 +495,7 @@ def volatility_state(df: pd.DataFrame) -> dict[str, Any]:
         and volume_ratio is not None
         and volume_ratio >= 1.1
     )
+
 
     return {
         "available": True,
@@ -503,6 +514,8 @@ def volatility_state(df: pd.DataFrame) -> dict[str, Any]:
         "volume_5d_vs_20d": ind._round(volume_ratio, 4),
         "was_compressed_within_10_bars": was_compressed,
         "bandwidth_expanding": expanding,
+        "bandwidth_expansion_ratio_from_5d_min": ind._round(expansion_ratio, 4),
+        "atr_expanding": atr_expanding,
         "compression_expansion_transition": transition,
         "lookback_bars_for_percentiles": min(VOL_PERCENTILE_LOOKBACK, len(df)),
         "note": (
@@ -648,6 +661,88 @@ def market_breadth(frames: dict[str, pd.DataFrame]) -> dict[str, Any]:
         ),
     }
 
+
+
+# ---------------------------------------------------------------------------
+# Feature D -- anomaly and correlation-regime intelligence
+# ---------------------------------------------------------------------------
+
+def _zscore_last(series: pd.Series, lookback: int = 90, min_samples: int = 30) -> tuple[float | None, int]:
+    """Z-score the latest finite observation against PRIOR observations only."""
+    x = series.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(x) < min_samples + 1:
+        return None, max(0, len(x) - 1)
+    hist = x.iloc[-(lookback + 1):-1] if len(x) > lookback else x.iloc[:-1]
+    if len(hist) < min_samples:
+        return None, len(hist)
+    sd = float(hist.std(ddof=1))
+    if not np.isfinite(sd) or sd <= 1e-12:
+        return None, len(hist)
+    return float((x.iloc[-1] - hist.mean()) / sd), len(hist)
+
+
+def anomaly_state(df: pd.DataFrame) -> dict[str, Any]:
+    """Return/volume/range anomalies versus the asset's own prior history."""
+    if len(df) < 40:
+        return {"available": False, "reason": f"{len(df)} bars; 40 required."}
+    close = df["close"].astype(float)
+    ret = close.pct_change() * 100.0
+    logvol = np.log1p(df["volume"].astype(float))
+    range_pct = (df["high"].astype(float) - df["low"].astype(float)) / close.replace(0, np.nan) * 100.0
+    rz, rn = _zscore_last(ret)
+    vz, vn = _zscore_last(logvol)
+    gz, gn = _zscore_last(range_pct)
+    return {
+        "available": any(v is not None for v in (rz, vz, gz)),
+        "return_1d_zscore": ind._round(rz, 4),
+        "volume_log_zscore": ind._round(vz, 4),
+        "range_zscore": ind._round(gz, 4),
+        "sample_sizes": {"return": rn, "volume": vn, "range": gn},
+        "lookback_bars": 90,
+        "note": "Z-scores use prior observations only; the current bar is never included in its own baseline.",
+    }
+
+
+def correlation_regime(df: pd.DataFrame, btc: pd.DataFrame) -> dict[str, Any]:
+    """Short-vs-medium BTC correlation and the resulting correlation delta."""
+    a = df["close"].astype(float).pct_change().dropna()
+    b = btc["close"].astype(float).pct_change().dropna()
+    aligned = pd.concat([a.rename("asset"), b.rename("btc")], axis=1).dropna()
+    if len(aligned) < 61:
+        return {"available": False, "reason": f"{len(aligned)} aligned returns; 61 required."}
+    short = float(aligned.iloc[-20:].corr().iloc[0, 1])
+    medium = float(aligned.iloc[-60:].corr().iloc[0, 1])
+    return {
+        "available": True,
+        "correlation_to_btc_20d": ind._round(short, 4),
+        "correlation_to_btc_60d": ind._round(medium, 4),
+        "correlation_delta_20d_vs_60d": ind._round(short - medium, 4),
+        "decoupling": bool(short <= medium - 0.20),
+        "note": "Decoupling is supporting evidence only; it is not directional by itself.",
+    }
+
+
+def _candidate_priority(strength: dict[str, Any], vol: dict[str, Any], anomaly: dict[str, Any], corr: dict[str, Any]) -> dict[str, Any]:
+    """Transparent 0-100 interest score used ONLY to prioritize deep dives."""
+    p = strength.get("composite_percentile")
+    leadership = float(p) if p is not None else 0.0
+    accel = max(0.0, float(strength.get("rank_acceleration") or 0.0))
+    chg3 = max(0.0, float(strength.get("rank_change_3d") or 0.0))
+    emergence = min(100.0, 4.0 * accel + 2.0 * chg3)
+    vz = anomaly.get("volume_log_zscore") if anomaly.get("available") else None
+    participation = min(100.0, max(0.0, 50.0 + 20.0 * float(vz))) if vz is not None else 0.0
+    bw = vol.get("bollinger_bandwidth_percentile") if vol.get("available") else None
+    vol_transition = 85.0 if vol.get("compression_expansion_transition") else (max(0.0, 60.0 - float(bw)) if bw is not None else 0.0)
+    delta = corr.get("correlation_delta_20d_vs_60d") if corr.get("available") else None
+    independence = min(100.0, max(0.0, -float(delta) * 200.0)) if delta is not None else 0.0
+    dims = {
+        "leadership": leadership, "emergence": emergence, "participation": participation,
+        "volatility_transition": vol_transition, "independence": independence,
+    }
+    # Leadership matters most, but an established leader can remain interesting
+    # even when rank acceleration has naturally flattened.
+    score = 0.35*leadership + 0.25*emergence + 0.15*participation + 0.15*vol_transition + 0.10*independence
+    return {"score": ind._round(score, 4), "dimensions": {k: ind._round(v, 4) for k,v in dims.items()}}
 
 # ---------------------------------------------------------------------------
 # Candidate promotion
@@ -817,6 +912,9 @@ def scan_universe(
     strength = cross_sectional_strength(frames)
     breadth = market_breadth(frames)
     vol_states = {sym: volatility_state(df) for sym, df in frames.items()}
+    anomaly_states = {sym: anomaly_state(df) for sym, df in frames.items()}
+    corr_states = {sym: correlation_regime(df, frames["BTC"]) for sym, df in frames.items()}
+    priority = {sym: _candidate_priority(strength["assets"].get(sym, {}), vol_states[sym], anomaly_states[sym], corr_states[sym]) for sym in frames}
 
     # Pass 1: raw flags for every asset, against a volume bar drawn from this
     # scan's own distribution rather than a fixed ratio.
@@ -912,11 +1010,23 @@ def scan_universe(
                 if v.get("available")
                 else None,
                 "promoted": promotion_by_symbol[sym]["promote"],
+                "candidate_priority": priority[sym]["score"],
+                "return_1d_zscore": anomaly_states[sym].get("return_1d_zscore"),
+                "volume_zscore": anomaly_states[sym].get("volume_log_zscore"),
+                "btc_corr_20d": corr_states[sym].get("correlation_to_btc_20d"),
+                "btc_corr_delta": corr_states[sym].get("correlation_delta_20d_vs_60d"),
             }
         )
-    leaderboard.sort(
-        key=lambda d: d["percentile"] if d["percentile"] is not None else -1, reverse=True
-    )
+    leaderboard.sort(key=lambda d: d["candidate_priority"], reverse=True)
+
+    # Always provide a small deterministic deep-dive queue on a healthy scan.
+    # This prevents a language model from declaring the entire universe boring.
+    # It does NOT force an entry: every downstream technical/risk gate remains.
+    deep_dive_candidates = [
+        {"symbol": row["symbol"], "candidate_priority": row["candidate_priority"],
+         "percentile": row["percentile"], "promoted": row["promoted"]}
+        for row in leaderboard if row["symbol"] != "BTC"
+    ][:3]
 
     result: dict[str, Any] = {
         "source": "Kraken public API, completed daily candles only",
@@ -927,6 +1037,8 @@ def scan_universe(
         "elapsed_seconds": ind._round(time.time() - started, 4),
         "market_breadth": breadth,
         "promoted_candidates": promoted,
+        "recommended_deep_dives": deep_dive_candidates,
+        "deep_dive_policy": "Deep-dive the top 3 non-BTC quantitative candidates on every healthy full scan. This prioritizes investigation only and never forces a trade.",
         "promotion_rules": {
             "gate": (
                 f"Relative-strength percentile must be at least "
@@ -962,6 +1074,9 @@ def scan_universe(
                 "bars_available": len(frames[sym]),
                 "relative_strength": strength["assets"].get(sym, {}),
                 "volatility_state": vol_states[sym],
+                "anomaly_state": anomaly_states[sym],
+                "correlation_regime": corr_states[sym],
+                "candidate_priority": priority[sym],
                 "promotion": promotion_by_symbol[sym],
             }
             for sym in sorted(frames)
