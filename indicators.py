@@ -1399,7 +1399,7 @@ def suggest_position_size(
     entry_price: float,
     collar_adjusted_stop_price: float,
     risk_budget_pct: float = 2.0,
-    min_position_usd: float = 50.0,
+    min_position_usd: float = 25.0,
     max_position_pct: float = 40.0,
 ) -> dict[str, Any]:
     """
@@ -1486,7 +1486,7 @@ def validate_trade_setup(
     reward_to_risk_floor: float = 1.5,
     reward_to_risk_exception_floor: float = 1.2,
     allow_exception: bool = False,
-    min_position_usd: float = 50.0,
+    min_position_usd: float = 25.0,
     max_position_pct: float = 40.0,
     portfolio_risk_cap_pct: float = 10.0,
 ) -> dict[str, Any]:

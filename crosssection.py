@@ -867,11 +867,48 @@ def _suppressed_categories(
 
 
 # ---------------------------------------------------------------------------
+# Universe eligibility helpers
+# ---------------------------------------------------------------------------
+
+def _average_daily_dollar_volume(
+    df: pd.DataFrame, window: int = 30
+) -> tuple[float | None, int]:
+    """
+    Mean completed-candle dollar volume over the most recent `window` daily bars.
+
+    Kraken OHLC volume is base-asset volume, so approximate traded notional is
+    close * volume for each completed daily candle. This is a deterministic
+    universe filter, not an execution-liquidity estimate; get_liquidity_profile
+    remains the pre-trade order-book gate.
+    """
+    if "close" not in df.columns or "volume" not in df.columns:
+        return None, 0
+    n = min(window, len(df))
+    if n <= 0:
+        return None, 0
+    tail = df.iloc[-n:]
+    notionals = (
+        pd.to_numeric(tail["close"], errors="coerce")
+        * pd.to_numeric(tail["volume"], errors="coerce")
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    if notionals.empty:
+        return None, 0
+    value = float(notionals.mean())
+    if not np.isfinite(value):
+        return None, int(len(notionals))
+    return value, int(len(notionals))
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def scan_universe(
-    symbols: list[str], detail: str = "summary", max_symbols: int = 120
+    symbols: list[str],
+    detail: str = "summary",
+    max_symbols: int = 120,
+    min_avg_daily_volume_usd: float = 2_000_000.0,
+    volume_lookback_days: int = 30,
 ) -> dict[str, Any]:
     """
     Run the full cross-sectional pass over an eligible universe.
@@ -891,6 +928,12 @@ def scan_universe(
     cost of a larger universe is longer scan time, not rate-limit risk. The
     cap still exists to catch a caller accidentally passing an unfiltered
     exchange-wide symbol list.
+
+    Before ranks or deep-dive recommendations are built, fetched assets are
+    filtered for at least MIN_BARS_FOR_RANKING completed daily candles and for
+    average completed-candle dollar volume >= min_avg_daily_volume_usd, measured
+    over volume_lookback_days (default 30). Exclusions are returned explicitly
+    so an ineligible asset cannot consume a recommended_deep_dives slot.
     """
     if detail not in ("summary", "full"):
         return {"error": "detail must be 'summary' or 'full'."}
@@ -906,16 +949,85 @@ def scan_universe(
         }
 
     started = time.time()
-    frames, failures = fetch_universe(symbols)
+    fetched_frames, failures = fetch_universe(symbols)
+    fetched_count = len(fetched_frames)
 
     # BTC anchors every relative measurement; without it nothing is comparable.
-    if "BTC" not in frames:
+    if "BTC" not in fetched_frames:
         return {
             "error": (
                 "BTC candles could not be fetched, so relative-strength and "
                 "breadth cannot be computed. No partial results are returned."
             ),
             "fetch_failures": failures,
+        }
+
+    eligibility_exclusions: list[dict[str, Any]] = []
+    frames: dict[str, pd.DataFrame] = {}
+    liquidity_by_symbol: dict[str, dict[str, Any]] = {}
+
+    for sym, df in fetched_frames.items():
+        if len(df) < MIN_BARS_FOR_RANKING:
+            eligibility_exclusions.append(
+                {
+                    "symbol": sym,
+                    "criterion": "insufficient_history",
+                    "value": len(df),
+                    "threshold": MIN_BARS_FOR_RANKING,
+                    "reason": (
+                        f"{len(df)} completed daily candles; "
+                        f"{MIN_BARS_FOR_RANKING} required for ranking."
+                    ),
+                }
+            )
+            continue
+
+        avg_dollar_vol, volume_samples = _average_daily_dollar_volume(
+            df, window=volume_lookback_days
+        )
+        liquidity_by_symbol[sym] = {
+            "average_daily_dollar_volume_usd": ind._round(avg_dollar_vol, 4),
+            "lookback_days_requested": volume_lookback_days,
+            "samples_used": volume_samples,
+        }
+        if avg_dollar_vol is None:
+            eligibility_exclusions.append(
+                {
+                    "symbol": sym,
+                    "criterion": "average_daily_volume_unavailable",
+                    "value": None,
+                    "threshold_usd": min_avg_daily_volume_usd,
+                    "reason": "Could not compute completed-candle dollar volume.",
+                }
+            )
+            continue
+
+        if avg_dollar_vol < min_avg_daily_volume_usd:
+            eligibility_exclusions.append(
+                {
+                    "symbol": sym,
+                    "criterion": "average_daily_volume_below_threshold",
+                    "value_usd": ind._round(avg_dollar_vol, 4),
+                    "threshold_usd": min_avg_daily_volume_usd,
+                    "lookback_days": volume_lookback_days,
+                    "reason": (
+                        f"Average daily dollar volume ${avg_dollar_vol:,.0f} is below "
+                        f"the ${min_avg_daily_volume_usd:,.0f} universe threshold."
+                    ),
+                }
+            )
+            continue
+
+        frames[sym] = df
+
+    if "BTC" not in frames:
+        return {
+            "error": (
+                "BTC did not survive the universe eligibility filter, so "
+                "relative-strength and breadth cannot be computed."
+            ),
+            "fetch_failures": failures,
+            "eligibility_exclusions": eligibility_exclusions,
         }
 
     strength = cross_sectional_strength(frames)
@@ -1024,6 +1136,9 @@ def scan_universe(
                 "volume_zscore": anomaly_states[sym].get("volume_log_zscore"),
                 "btc_corr_20d": corr_states[sym].get("correlation_to_btc_20d"),
                 "btc_corr_delta": corr_states[sym].get("correlation_delta_20d_vs_60d"),
+                "average_daily_dollar_volume_usd": (
+                    liquidity_by_symbol.get(sym, {}).get("average_daily_dollar_volume_usd")
+                ),
             }
         )
     leaderboard.sort(key=lambda d: d["candidate_priority"], reverse=True)
@@ -1041,8 +1156,15 @@ def scan_universe(
         "source": "Kraken public API, completed daily candles only",
         "detail": detail,
         "requested": len(symbols),
-        "fetched": len(frames),
+        "fetched": fetched_count,
         "fetch_failures": failures,
+        "eligibility_exclusions": eligibility_exclusions,
+        "eligible_after_filters": len(frames),
+        "eligibility_rules": {
+            "minimum_completed_daily_bars": MIN_BARS_FOR_RANKING,
+            "minimum_average_daily_dollar_volume_usd": min_avg_daily_volume_usd,
+            "average_daily_volume_lookback_days": volume_lookback_days,
+        },
         "elapsed_seconds": ind._round(time.time() - started, 4),
         "market_breadth": breadth,
         "promoted_candidates": promoted,
@@ -1087,6 +1209,7 @@ def scan_universe(
                 "correlation_regime": corr_states[sym],
                 "candidate_priority": priority[sym],
                 "promotion": promotion_by_symbol[sym],
+                "universe_liquidity": liquidity_by_symbol.get(sym, {}),
             }
             for sym in sorted(frames)
         }

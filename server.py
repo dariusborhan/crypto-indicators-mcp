@@ -421,7 +421,7 @@ def suggest_position_size(
     entry_price: float,
     collar_adjusted_stop_price: float,
     risk_budget_pct: float = 2.0,
-    min_position_usd: float = 50.0,
+    min_position_usd: float = 25.0,
     max_position_pct: float = 40.0,
 ) -> dict[str, Any]:
     """
@@ -449,7 +449,7 @@ def suggest_position_size(
             pass 1.25 when portfolio drawdown is in the 15-25% band per the
             strategy's risk controls, or use validate_trade_setup instead of
             calling this directly once drawdown is that high.
-        min_position_usd: Position size floor. Default 50.
+        min_position_usd: Position size floor. Default 25.
         max_position_pct: Position size ceiling, percent of equity. Default 40.
     """
     return ind.suggest_position_size(
@@ -474,7 +474,7 @@ def validate_trade_setup(
     reward_to_risk_floor: float = 1.5,
     reward_to_risk_exception_floor: float = 1.2,
     allow_exception: bool = False,
-    min_position_usd: float = 50.0,
+    min_position_usd: float = 25.0,
     max_position_pct: float = 40.0,
     portfolio_risk_cap_pct: float = 10.0,
 ) -> dict[str, Any]:
@@ -524,7 +524,7 @@ def validate_trade_setup(
             The calling agent must track that this is used at most once per
             ten trades and flag it in the journal/summary; this tool has no
             memory of past calls.
-        min_position_usd: Position size floor. Default 50.
+        min_position_usd: Position size floor. Default 25.
         max_position_pct: Position size ceiling, percent of equity. Default 40.
         portfolio_risk_cap_pct: Max total collar-adjusted open risk across the
             whole portfolio after this trade. Default 10.
@@ -690,7 +690,11 @@ def detect_divergence(symbol: str, timeframe: str = "1d") -> dict[str, Any]:
 
 
 @mcp.tool()
-def scan_universe(symbols: list[str], detail: str = "summary") -> dict[str, Any]:
+def scan_universe(
+    symbols: list[str],
+    detail: str = "summary",
+    min_avg_daily_volume_usd: float = 2_000_000.0,
+) -> dict[str, Any]:
     """
     Rank an entire eligible universe against itself in one call, and return
     the handful of assets worth a full deep dive.
@@ -735,8 +739,11 @@ def scan_universe(symbols: list[str], detail: str = "summary") -> dict[str, Any]
     Args:
         symbols: The eligible universe to rank, e.g. ["BTC", "ETH", "SOL", ...].
             Include "BTC"; it anchors every relative measurement, and the scan
-            returns an error rather than partial results without it. At most 60
+            returns an error rather than partial results without it. At most 120
             symbols per call, to stay within the upstream rate limit.
+        min_avg_daily_volume_usd: Universe-liquidity floor applied BEFORE
+            ranking and recommended_deep_dives. Default $2,000,000 of average
+            completed-candle dollar volume over 30 daily bars.
         detail: "summary" (default) returns breadth, the promoted shortlist
             with reasons, and a one-line-per-asset leaderboard -- everything
             needed to choose deep-dive candidates, small enough to read inside
@@ -745,7 +752,11 @@ def scan_universe(symbols: list[str], detail: str = "summary") -> dict[str, Any]
             inspection, not in a run.
     """
     try:
-        return cx.scan_universe(symbols, detail=detail)
+        return cx.scan_universe(
+            symbols,
+            detail=detail,
+            min_avg_daily_volume_usd=min_avg_daily_volume_usd,
+        )
     except ds.DataSourceError as exc:
         return _error(str(exc))
     except Exception as exc:  # noqa: BLE001
