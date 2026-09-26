@@ -476,7 +476,7 @@ def validate_trade_setup(
     allow_exception: bool = False,
     min_position_usd: float = 25.0,
     max_position_pct: float = 40.0,
-    portfolio_risk_cap_pct: float = 10.0,
+    portfolio_risk_cap_pct: float = 12.0,
 ) -> dict[str, Any]:
     """
     The hard, external gate a proposed long spot entry must clear before any
@@ -527,7 +527,7 @@ def validate_trade_setup(
         min_position_usd: Position size floor. Default 25.
         max_position_pct: Position size ceiling, percent of equity. Default 40.
         portfolio_risk_cap_pct: Max total collar-adjusted open risk across the
-            whole portfolio after this trade. Default 10.
+            whole portfolio after this trade. Default 12.
     """
     return ind.validate_trade_setup(
         entry_price=entry_price,
